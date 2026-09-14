@@ -1,0 +1,3282 @@
+Directory structure:
+└── AI Automation - Datakernels/
+    ├── automation/
+    │   ├── config.py
+    │   ├── excel_reader.py
+    │   ├── executor.py
+    │   ├── generate_test_cases.py
+    │   ├── main.py
+    │   ├── models.py
+    │   ├── requirements.txt
+    │   ├── screenshot_manager.py
+    │   ├── step_parser.py
+    │   └── waits.py
+    ├── Hotel_Booking/
+    │   ├── README.md
+    │   ├── index.html
+    │   ├── package.json
+    │   ├── vite.config.js
+    │   ├── .oxlintrc.json
+    │   └── src/
+    │       ├── App.jsx
+    │       ├── index.css
+    │       ├── main.jsx
+    │       ├── components/
+    │       │   ├── BookingCard.jsx
+    │       │   ├── BookingForm.jsx
+    │       │   ├── ErrorMessage.jsx
+    │       │   ├── Navbar.jsx
+    │       │   ├── RoomCard.jsx
+    │       │   └── SearchForm.jsx
+    │       ├── data/
+    │       │   └── rooms.js
+    │       ├── pages/
+    │       │   ├── Booking.jsx
+    │       │   ├── Bookings.jsx
+    │       │   ├── Confirmation.jsx
+    │       │   ├── Home.jsx
+    │       │   ├── RoomDetails.jsx
+    │       │   └── SearchResults.jsx
+    │       └── utils/
+    │           ├── bookingStorage.js
+    │           ├── formatDate.js
+    │           └── validation.js
+    └── test_cases/
+        └── sample_test_cases.xlsx
+
+================================================
+FILE: automation/config.py
+================================================
+import os
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(BASE_DIR)
+
+BASE_URL = "http://localhost:5173"
+DEFAULT_TIMEOUT = 10000
+MAX_RETRIES = 1
+SCREENSHOT_DIR = os.path.join(PROJECT_ROOT, "screenshots")
+TEST_CASES_DIR = os.path.join(PROJECT_ROOT, "test_cases")
+EXCEL_FILE = os.path.join(TEST_CASES_DIR, "sample_test_cases.xlsx")
+
+
+
+================================================
+FILE: automation/excel_reader.py
+================================================
+import os
+from openpyxl import load_workbook
+from models import TestCase
+from config import EXCEL_FILE
+
+REQUIRED_COLUMNS = [
+    "Test ID",
+    "Test Name",
+    "Category",
+    "Steps",
+    "Expected Result",
+    "Status",
+    "AI Observation"
+]
+
+def load_test_cases() -> list[TestCase]:
+    if not os.path.exists(EXCEL_FILE):
+        raise FileNotFoundError(f"Excel file not found at {EXCEL_FILE}")
+
+    wb = load_workbook(EXCEL_FILE)
+    sheet = wb.active
+
+    headers = [cell.value for cell in sheet[1]]
+    
+    for col in REQUIRED_COLUMNS:
+        if col not in headers:
+            raise ValueError(f"Missing required column: {col}")
+
+    col_indices = {col: headers.index(col) for col in REQUIRED_COLUMNS}
+    test_cases = []
+
+    for row in sheet.iter_rows(min_row=2, values_only=True):
+        test_id = row[col_indices["Test ID"]]
+        if not test_id:
+            continue
+            
+        test_case = TestCase(
+            test_id=str(test_id),
+            test_name=str(row[col_indices["Test Name"]]),
+            category=str(row[col_indices["Category"]]),
+            raw_steps=str(row[col_indices["Steps"]]),
+            expected_result=str(row[col_indices["Expected Result"]]),
+            status=str(row[col_indices["Status"]] or "NOT RUN"),
+            ai_observation=str(row[col_indices["AI Observation"]]) if row[col_indices["AI Observation"]] else None
+        )
+        test_cases.append(test_case)
+
+    return test_cases
+
+
+
+================================================
+FILE: automation/executor.py
+================================================
+import traceback
+from playwright.sync_api import Page, expect
+from typing import Dict, Any
+
+from config import BASE_URL
+from waits import wait_for_visible
+
+def execute_step(page: Page, parsed_step: Dict[str, Any]) -> None:
+    """
+    Executes a single parsed step using Playwright.
+    Raises an exception if the step fails.
+    """
+    command = parsed_step.get("command")
+    target = parsed_step.get("target")
+    value = parsed_step.get("value")
+
+    if not command:
+        raise ValueError("Invalid step: No command found.")
+
+    if command == "OPEN":
+        url = BASE_URL + (target if target else "/")
+        page.goto(url)
+    
+    elif command == "FILL":
+        if not target:
+            raise ValueError(f"Target missing for command {command}")
+        # value can be empty string in case of empty input validation
+        val = value if value is not None else ""
+        locator = page.get_by_test_id(target)
+        locator.fill(val)
+        
+    elif command == "CLICK":
+        if not target:
+            raise ValueError(f"Target missing for command {command}")
+        locator = page.get_by_test_id(target)
+        locator.click()
+        
+    elif command == "WAIT_FOR":
+        if not target:
+            raise ValueError(f"Target missing for command {command}")
+        wait_for_visible(page, target)
+        
+    elif command == "ASSERT_VISIBLE":
+        if not target:
+            raise ValueError(f"Target missing for command {command}")
+        locator = page.get_by_test_id(target)
+        expect(locator).to_be_visible()
+        
+    elif command == "ASSERT_TEXT":
+        if not target:
+            raise ValueError(f"Target missing for command {command}")
+        locator = page.get_by_test_id(target)
+        expect(locator).to_contain_text(value if value else "")
+        
+    elif command == "SELECT":
+        if not target:
+            raise ValueError(f"Target missing for command {command}")
+        locator = page.get_by_test_id(target)
+        locator.select_option(value)
+        
+    elif command == "CLEAR":
+        if not target:
+            raise ValueError(f"Target missing for command {command}")
+        locator = page.get_by_test_id(target)
+        locator.clear()
+        
+    elif command == "SCREENSHOT":
+        # Handled by main runner logic since it needs test context (test_id, step_number)
+        pass
+        
+    else:
+        raise ValueError(f"Unsupported command: {command}")
+
+
+
+================================================
+FILE: automation/generate_test_cases.py
+================================================
+import os
+from openpyxl import Workbook
+from config import EXCEL_FILE, TEST_CASES_DIR
+
+def write_test_cases():
+    os.makedirs(TEST_CASES_DIR, exist_ok=True)
+    
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Test Cases"
+    
+    headers = [
+        "Test ID", "Test Name", "Category", "Steps", 
+        "Expected Result", "Status", "AI Observation"
+    ]
+    ws.append(headers)
+    
+    tc_001_steps = """OPEN: /
+FILL: city-input = New York
+FILL: checkin-input = 2026-09-20
+FILL: checkout-input = 2026-09-23
+FILL: guests-input = 2
+CLICK: search-button
+WAIT_FOR: room-card-1
+CLICK: view-details-1
+WAIT_FOR: room-name
+CLICK: book-now-button
+WAIT_FOR: first-name-input
+FILL: first-name-input = John
+FILL: last-name-input = Doe
+FILL: email-input = john@example.com
+FILL: phone-input = 9876543210
+FILL: booking-checkin-input = 2026-09-20
+FILL: booking-checkout-input = 2026-09-23
+FILL: booking-guests-input = 2
+FILL: special-requests-input = No special requests
+FILL: card-number-input = 4111111111111111
+FILL: expiry-input = 12/30
+FILL: cvv-input = 123
+CLICK: confirm-booking-button
+WAIT_FOR: booking-confirmation
+ASSERT_VISIBLE: booking-confirmation
+ASSERT_TEXT: booking-reference CONTAINS BK-
+SCREENSHOT: TC-001_step-26_success"""
+
+    tc_002_steps = """OPEN: /
+FILL: city-input = New York
+FILL: checkin-input = 2026-09-20
+FILL: checkout-input = 2026-09-23
+FILL: guests-input = 2
+CLICK: search-button
+WAIT_FOR: room-card-1
+ASSERT_VISIBLE: room-card-1
+SCREENSHOT: TC-002_step-08_success"""
+
+    tc_003_steps = """OPEN: /
+FILL: city-input = New York
+FILL: checkin-input = 2026-09-20
+FILL: checkout-input = 2026-09-23
+FILL: guests-input = 2
+CLICK: search-button
+WAIT_FOR: room-card-1
+CLICK: view-details-1
+WAIT_FOR: room-name
+ASSERT_VISIBLE: room-name
+ASSERT_VISIBLE: room-type
+ASSERT_VISIBLE: room-price
+SCREENSHOT: TC-003_step-12_success"""
+
+    tc_004_steps = """OPEN: /
+FILL: city-input = New York
+FILL: checkin-input = 2026-09-20
+FILL: checkout-input = 2026-09-23
+FILL: guests-input = 2
+CLICK: search-button
+WAIT_FOR: room-card-1
+CLICK: view-details-1
+WAIT_FOR: room-name
+CLICK: book-now-button
+WAIT_FOR: first-name-input
+FILL: first-name-input = John
+FILL: last-name-input = Doe
+FILL: email-input = john@example.com
+FILL: phone-input = 9876543210
+FILL: booking-checkin-input = 2026-09-20
+FILL: booking-checkout-input = 2026-09-23
+FILL: booking-guests-input = 2
+FILL: card-number-input = 4111111111111111
+FILL: expiry-input = 12/30
+FILL: cvv-input = 123
+CLICK: confirm-booking-button
+WAIT_FOR: booking-confirmation
+OPEN: /bookings
+WAIT_FOR: booking-card-1
+ASSERT_VISIBLE: booking-card-1
+SCREENSHOT: TC-004_step-26_success"""
+
+    base_validation_prefix = """OPEN: /
+FILL: city-input = New York
+FILL: checkin-input = 2026-09-20
+FILL: checkout-input = 2026-09-23
+FILL: guests-input = 2
+CLICK: search-button
+WAIT_FOR: room-card-1
+CLICK: view-details-1
+WAIT_FOR: room-name
+CLICK: book-now-button
+WAIT_FOR: first-name-input
+FILL: first-name-input = John
+FILL: last-name-input = Doe
+FILL: email-input = john@example.com
+FILL: phone-input = 9876543210
+FILL: booking-checkin-input = 2026-09-20
+FILL: booking-checkout-input = 2026-09-23
+FILL: booking-guests-input = 2
+FILL: card-number-input = 4111111111111111
+FILL: expiry-input = 12/30
+FILL: cvv-input = 123\n"""
+
+    def generate_validation_test(field_to_override: str, override_value: str, error_test_id: str) -> str:
+        lines = base_validation_prefix.strip().split("\n")
+        new_lines = []
+        for line in lines:
+            if line.startswith(f"FILL: {field_to_override} ="):
+                if override_value == "":
+                    new_lines.append(f"FILL: {field_to_override} =")
+                else:
+                    new_lines.append(f"FILL: {field_to_override} = {override_value}")
+            else:
+                new_lines.append(line)
+        new_lines.append("CLICK: confirm-booking-button")
+        new_lines.append(f"WAIT_FOR: {error_test_id}")
+        new_lines.append(f"ASSERT_VISIBLE: {error_test_id}")
+        new_lines.append("SCREENSHOT: validation_error")
+        return "\n".join(new_lines)
+
+    tc_005_steps = generate_validation_test("first-name-input", "", "first-name-error")
+    tc_006_steps = generate_validation_test("last-name-input", "", "last-name-error")
+    tc_007_steps = generate_validation_test("email-input", "invalid-email", "email-error")
+    tc_008_steps = generate_validation_test("phone-input", "abcdefghij", "phone-error")
+    tc_009_steps = generate_validation_test("phone-input", "12345", "phone-error")
+    tc_010_steps = generate_validation_test("booking-checkout-input", "2026-09-18", "booking-checkout-error")
+    tc_011_steps = generate_validation_test("booking-guests-input", "0", "booking-guests-error")
+    tc_012_steps = generate_validation_test("booking-guests-input", "11", "booking-guests-error")
+    tc_013_steps = generate_validation_test("card-number-input", "1234", "card-error")
+    tc_014_steps = generate_validation_test("expiry-input", "10/20", "expiry-error") # hardcoded expired date
+    tc_015_steps = generate_validation_test("cvv-input", "12", "cvv-error")
+
+
+    tests = [
+        ("TC-001", "Complete valid booking flow", "Happy Path", tc_001_steps, "Booking confirmation displayed"),
+        ("TC-002", "Search for available rooms", "Happy Path", tc_002_steps, "Available rooms are displayed"),
+        ("TC-003", "View room details", "Happy Path", tc_003_steps, "Room details are displayed"),
+        ("TC-004", "View my bookings", "Happy Path", tc_004_steps, "User bookings are displayed"),
+        ("TC-005", "Empty first name", "Validation", tc_005_steps, "First name validation error is displayed"),
+        ("TC-006", "Empty last name", "Validation", tc_006_steps, "Last name validation error is displayed"),
+        ("TC-007", "Invalid email format", "Validation", tc_007_steps, "Email validation error is displayed"),
+        ("TC-008", "Invalid phone (letters)", "Validation", tc_008_steps, "Phone validation error is displayed"),
+        ("TC-009", "Phone less than 10 digits", "Validation", tc_009_steps, "Phone length validation error is displayed"),
+        ("TC-010", "Check-out before check-in", "Validation", tc_010_steps, "Check-out validation error is displayed"),
+        ("TC-011", "Guests = 0", "Validation", tc_011_steps, "Guests min validation error is displayed"),
+        ("TC-012", "Guests > 10", "Validation", tc_012_steps, "Guests max validation error is displayed"),
+        ("TC-013", "Invalid card number", "Validation", tc_013_steps, "Card length validation error is displayed"),
+        ("TC-014", "Expired card date", "Validation", tc_014_steps, "Expiry validation error is displayed"),
+        ("TC-015", "Invalid CVV", "Validation", tc_015_steps, "CVV validation error is displayed"),
+    ]
+
+    for t in tests:
+        ws.append([t[0], t[1], t[2], t[3], t[4], "NOT RUN", ""])
+        
+    wb.save(EXCEL_FILE)
+    print(f"Generated {EXCEL_FILE} successfully.")
+
+if __name__ == "__main__":
+    write_test_cases()
+
+
+
+================================================
+FILE: automation/main.py
+================================================
+import traceback
+from playwright.sync_api import sync_playwright
+
+from excel_reader import load_test_cases
+from step_parser import parse_step
+from executor import execute_step
+from screenshot_manager import capture_screenshot
+from models import TestExecutionResult
+
+def run_tests():
+    print("=" * 40)
+    print("AI HOTEL TEST AUTOMATION")
+    print("=" * 40)
+    print("")
+
+    try:
+        test_cases = load_test_cases()
+    except Exception as e:
+        print(f"Failed to load test cases: {e}")
+        return
+
+    results = []
+    passed = 0
+    failed = 0
+
+    with sync_playwright() as p:
+        # Note: Set headless=False for manual verification, True for CI
+        browser = p.chromium.launch(headless=False)
+        
+        for test_case in test_cases:
+            print(f"Running {test_case.test_id}...")
+            
+            context = browser.new_context()
+            page = context.new_page()
+            
+            steps = test_case.raw_steps.strip().split('\n')
+            
+            test_status = "PASS"
+            test_error = None
+            executed_steps = []
+            test_screenshots = []
+            
+            step_number = 1
+            for raw_step in steps:
+                if not raw_step.strip():
+                    continue
+                    
+                parsed = parse_step(raw_step)
+                if not parsed:
+                    continue
+
+                step_result = {
+                    "step_number": step_number,
+                    "command": parsed.get("command"),
+                    "target": parsed.get("target"),
+                    "value": parsed.get("value"),
+                    "status": "PASS",
+                    "screenshot": None,
+                    "error": None
+                }
+                
+                try:
+                    execute_step(page, parsed)
+                    
+                    if parsed.get("command") == "SCREENSHOT":
+                        target_name = parsed.get("target", f"step_{step_number}")
+                        screenshot_path = capture_screenshot(page, test_case.test_id, step_number, target_name)
+                        step_result["screenshot"] = screenshot_path
+                        test_screenshots.append(screenshot_path)
+                    
+                except Exception as e:
+                    step_result["status"] = "FAIL"
+                    step_result["error"] = str(e)
+                    test_status = "FAIL"
+                    test_error = str(e)
+                    
+                    try:
+                        screenshot_path = capture_screenshot(page, test_case.test_id, step_number, "failure")
+                        step_result["screenshot"] = screenshot_path
+                        test_screenshots.append(screenshot_path)
+                    except:
+                        pass
+                        
+                    executed_steps.append(step_result)
+                    break
+                    
+                executed_steps.append(step_result)
+                step_number += 1
+                
+            print(test_status)
+            if test_status == "PASS":
+                passed += 1
+            else:
+                failed += 1
+                print(f"  Error: {test_error}")
+                
+            results.append(TestExecutionResult(
+                test_id=test_case.test_id,
+                test_name=test_case.test_name,
+                status=test_status,
+                expected_result=test_case.expected_result,
+                actual_result="Success" if test_status == "PASS" else test_error,
+                steps=executed_steps,
+                screenshots=test_screenshots,
+                error=test_error
+            ))
+            
+            context.close()
+            
+        browser.close()
+
+    print("")
+    print("=" * 40)
+    print("SUMMARY")
+    print("=" * 40)
+    print(f"Total Tests: {len(test_cases)}")
+    print(f"Passed: {passed}")
+    print(f"Failed: {failed}")
+    print("=" * 40)
+    print("Note: AI verification is not enabled in Part 2.")
+
+if __name__ == "__main__":
+    run_tests()
+
+
+
+================================================
+FILE: automation/models.py
+================================================
+from dataclasses import dataclass, field
+from typing import List, Optional, Dict, Any
+
+@dataclass
+class TestStep:
+    step_number: int
+    command: str
+    target: Optional[str] = None
+    value: Optional[str] = None
+    status: str = "NOT RUN"
+    screenshot: Optional[str] = None
+    error: Optional[str] = None
+
+@dataclass
+class TestCase:
+    test_id: str
+    test_name: str
+    category: str
+    raw_steps: str
+    expected_result: str
+    status: str = "NOT RUN"
+    ai_observation: Optional[str] = None
+    
+    # For execution
+    steps: List[TestStep] = field(default_factory=list)
+    actual_result: Optional[str] = None
+    screenshots: List[str] = field(default_factory=list)
+    error: Optional[str] = None
+    
+    # Part 3 placeholders
+    ai_status: Optional[str] = None
+    ai_confidence: Optional[str] = None
+
+@dataclass
+class TestExecutionResult:
+    test_id: str
+    test_name: str
+    status: str
+    expected_result: str
+    actual_result: str
+    steps: List[Dict[str, Any]]
+    screenshots: List[str]
+    error: Optional[str]
+    ai_status: Optional[str] = None
+    ai_confidence: Optional[str] = None
+    ai_observation: Optional[str] = None
+
+
+
+================================================
+FILE: automation/requirements.txt
+================================================
+playwright
+openpyxl
+
+
+================================================
+FILE: automation/screenshot_manager.py
+================================================
+import os
+from playwright.sync_api import Page
+from config import SCREENSHOT_DIR
+
+def capture_screenshot(page: Page, test_id: str, step_number: int, step_name: str = "") -> str:
+    """
+    Captures a screenshot of the current page state.
+    Returns the absolute path to the saved screenshot.
+    """
+    test_dir = os.path.join(SCREENSHOT_DIR, test_id)
+    os.makedirs(test_dir, exist_ok=True)
+    
+    # Format: step-01.png or step-01_home.png
+    safe_step_name = f"_{step_name}" if step_name else ""
+    filename = f"step-{step_number:02d}{safe_step_name}.png"
+    filepath = os.path.join(test_dir, filename)
+    
+    page.screenshot(path=filepath, full_page=False)
+    
+    return filepath
+
+
+
+================================================
+FILE: automation/step_parser.py
+================================================
+def parse_step(raw_step: str) -> dict:
+    """
+    Parses a single machine-readable step into a dictionary.
+    Examples:
+    "OPEN: /" -> {"command": "OPEN", "target": "/"}
+    "FILL: email-input = john@example.com" -> {"command": "FILL", "target": "email-input", "value": "john@example.com"}
+    "CLICK: search-button" -> {"command": "CLICK", "target": "search-button"}
+    """
+    if not raw_step or not raw_step.strip():
+        return {}
+
+    parts = raw_step.split(":", 1)
+    command = parts[0].strip().upper()
+    
+    if len(parts) < 2:
+        return {"command": command}
+        
+    target_part = parts[1].strip()
+    
+    # Check if there's a value component for FILL or ASSERT_TEXT
+    if command == "FILL" and "=" in target_part:
+        t_parts = target_part.split("=", 1)
+        target = t_parts[0].strip()
+        value = t_parts[1].strip()
+        return {"command": command, "target": target, "value": value}
+    elif command == "ASSERT_TEXT" and " CONTAINS " in target_part:
+        t_parts = target_part.split(" CONTAINS ", 1)
+        target = t_parts[0].strip()
+        value = t_parts[1].strip()
+        return {"command": command, "target": target, "value": value}
+        
+    return {"command": command, "target": target_part}
+
+
+
+================================================
+FILE: automation/waits.py
+================================================
+from playwright.sync_api import Page
+from config import DEFAULT_TIMEOUT
+
+def wait_for_visible(page: Page, test_id: str, timeout: int = DEFAULT_TIMEOUT):
+    """Waits for an element with the given test_id to be visible."""
+    page.get_by_test_id(test_id).wait_for(state="visible", timeout=timeout)
+
+def wait_for_hidden(page: Page, test_id: str, timeout: int = DEFAULT_TIMEOUT):
+    """Waits for an element with the given test_id to be hidden."""
+    page.get_by_test_id(test_id).wait_for(state="hidden", timeout=timeout)
+
+def wait_for_page_ready(page: Page):
+    """Waits for the page to reach network idle state."""
+    page.wait_for_load_state("networkidle")
+
+
+
+================================================
+FILE: Hotel_Booking/README.md
+================================================
+# AI-Powered Automated Testing System - Part 1
+
+This is the completed Part 1 of the hiring assignment: **Hotel Booking Website**.
+
+## 1. Project Overview
+
+This is a responsive, client-side only React application for booking hotel rooms. It serves as the foundation for future automated testing using Python and Playwright. The application is built to be highly testable with predictable data, stable selectors, and deterministic validation.
+
+## 2. Technology Stack
+
+- React (v18)
+- Vite
+- React Router (v6)
+- JavaScript (.js / .jsx only)
+- CSS (Custom properties, no external frameworks)
+- localStorage for data persistence
+
+*Note: As per requirements, no TypeScript, real APIs, databases, or backend servers were used.*
+
+## 3. Features
+
+- **Search Hotels**: Filter available rooms by city, dates, and guests.
+- **View Rooms**: Browse a list of available rooms with their amenities and pricing.
+- **Room Details**: View in-depth information about a specific room.
+- **Booking Flow**: Complete a detailed booking form with rigorous validation.
+- **Confirmation**: Receive a unique booking reference upon successful booking.
+- **My Bookings**: View a history of all bookings stored locally.
+
+## 4. Project Structure
+
+```text
+src/
+â”œâ”€â”€ components/
+â”‚   â”œâ”€â”€ BookingCard.jsx    # Card displaying a confirmed booking
+â”‚   â”œâ”€â”€ BookingForm.jsx    # The main booking form with validation
+â”‚   â”œâ”€â”€ ErrorMessage.jsx   # Reusable validation error display
+â”‚   â”œâ”€â”€ Navbar.jsx         # Main navigation
+â”‚   â”œâ”€â”€ RoomCard.jsx       # Card displaying room summary in search results
+â”‚   â””â”€â”€ SearchForm.jsx     # The home page search form
+â”œâ”€â”€ data/
+â”‚   â””â”€â”€ rooms.js           # Static mock data for hotels/rooms
+â”œâ”€â”€ pages/
+â”‚   â”œâ”€â”€ Booking.jsx        # /book/:id page
+â”‚   â”œâ”€â”€ Bookings.jsx       # /bookings page
+â”‚   â”œâ”€â”€ Confirmation.jsx   # /confirmation page
+â”‚   â”œâ”€â”€ Home.jsx           # / (Home) page
+â”‚   â”œâ”€â”€ RoomDetails.jsx    # /room/:id page
+â”‚   â””â”€â”€ SearchResults.jsx  # /search page
+â”œâ”€â”€ utils/
+â”‚   â”œâ”€â”€ bookingStorage.js  # localStorage operations and reference generation
+â”‚   â”œâ”€â”€ formatDate.js      # Date formatting utilities
+â”‚   â””â”€â”€ validation.js      # Centralized, deterministic validation rules
+â”œâ”€â”€ App.jsx                # Main application component and routing
+â”œâ”€â”€ index.css              # Global styles and design system
+â””â”€â”€ main.jsx               # Application entry point
+```
+
+## 5. Installation
+
+To install the project dependencies, run:
+
+```bash
+npm install
+```
+
+## 6. How to Run
+
+To start the development server, run:
+
+```bash
+npm run dev
+```
+
+The application will be available at `http://localhost:5173`.
+
+## 7. Available Routes
+
+1. **Home**: `/`
+2. **Search Results**: `/search` (uses query parameters like `?city=New York&checkIn=...`)
+3. **Room Details**: `/room/:id`
+4. **Booking Form**: `/book/:id`
+5. **Confirmation**: `/confirmation`
+6. **My Bookings**: `/bookings`
+
+## 8. Validation Rules
+
+The application implements strict, deterministic validation exactly as requested:
+
+- **First/Last Name**: Required, minimum 2 characters.
+- **Email**: Required, valid format.
+- **Phone**: Required, exactly 10 digits.
+- **Check-in**: Required, today or future.
+- **Check-out**: Required, after check-in.
+- **Guests**: Required, between 1 and 10.
+- **Special Requests**: Optional, max 500 characters.
+- **Card Number**: Required, exactly 16 digits.
+- **Expiry**: Required, MM/YY format, must not be expired.
+- **CVV**: Required, exactly 3 digits.
+
+## 9. Booking Flow
+
+1. User searches on `/` -> Navigates to `/search?params...`
+2. User selects a room -> Navigates to `/room/:id`
+3. User clicks Book Now -> Navigates to `/book/:id`
+4. User fills valid form -> Booking saved to localStorage, Reference generated -> Navigates to `/confirmation`
+5. User clicks View My Bookings -> Navigates to `/bookings`
+
+## 10. localStorage Structure
+
+Data is stored under the key `"hotelBookings"` as an array of objects:
+
+```json
+[
+  {
+    "id": 1694602352355,
+    "referenceNumber": "BK-582910",
+    "roomId": 1,
+    "hotelName": "Grand Hotel",
+    "roomType": "Deluxe Room",
+    "firstName": "John",
+    "lastName": "Doe",
+    "email": "john@example.com",
+    "phone": "1234567890",
+    "checkIn": "2026-09-20",
+    "checkOut": "2026-09-23",
+    "guests": 2,
+    "specialRequests": "Late check-in",
+    "bookingStatus": "Confirmed",
+    "createdAt": "2026-09-13T10:52:32.355Z"
+  }
+]
+```
+
+## 11. Playwright Testability Considerations
+
+This application is designed specifically for future automated testing:
+- **`data-testid` Attributes**: Every important interactive element, input, and error message has a stable, unique `data-testid`.
+- **Deterministic Validation**: Validation logic does not rely on random factors or complex external state (other than the current date).
+- **Predictable Storage**: `localStorage` is used predictably without complex state hydration issues.
+- **URL Navigation**: Search parameters are passed via the URL (`/search?city=...`) to allow direct deep-linking during tests.
+- **Semantic HTML**: Proper `<form>`, `<input>`, and `<button>` elements are used instead of custom div-based components.
+
+
+
+================================================
+FILE: Hotel_Booking/index.html
+================================================
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="StayBooker - Find and book your perfect hotel stay. Search hotels, compare rooms, and make reservations with ease." />
+    <title>StayBooker — Hotel Booking</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🏨</text></svg>" />
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
+
+
+
+================================================
+FILE: Hotel_Booking/package.json
+================================================
+{
+  "name": "hotel-booking",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "lint": "oxlint",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "react-router-dom": "^7.18.3"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.7",
+    "@vitejs/plugin-react": "^6.1.1",
+    "oxlint": "^1.81.0",
+    "vite": "^8.3.0"
+  }
+}
+
+
+
+================================================
+FILE: Hotel_Booking/vite.config.js
+================================================
+import react from '@vitejs/plugin-react'
+import { defineConfig } from 'vite'
+
+// https://vite.dev/config/
+export default defineConfig({
+  plugins: [react()],
+})
+
+
+
+================================================
+FILE: Hotel_Booking/.oxlintrc.json
+================================================
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["react", "oxc"],
+  "rules": {
+    "react/rules-of-hooks": "error",
+    "react/only-export-components": ["warn", { "allowConstantExport": true }]
+  }
+}
+
+
+
+================================================
+FILE: Hotel_Booking/src/App.jsx
+================================================
+import { BrowserRouter, Routes, Route } from 'react-router-dom';
+import Navbar from './components/Navbar';
+import Home from './pages/Home';
+import SearchResults from './pages/SearchResults';
+import RoomDetails from './pages/RoomDetails';
+import Booking from './pages/Booking';
+import Confirmation from './pages/Confirmation';
+import Bookings from './pages/Bookings';
+import './index.css';
+
+export default function App() {
+  return (
+    <BrowserRouter>
+      <Navbar />
+      <main className="page-container">
+        <Routes>
+          <Route path="/" element={<Home />} />
+          <Route path="/search" element={<SearchResults />} />
+          <Route path="/room/:id" element={<RoomDetails />} />
+          <Route path="/book/:id" element={<Booking />} />
+          <Route path="/confirmation" element={<Confirmation />} />
+          <Route path="/bookings" element={<Bookings />} />
+        </Routes>
+      </main>
+      <footer className="footer">
+        <p>Â© 2026 StayBooker. All rights reserved.</p>
+      </footer>
+    </BrowserRouter>
+  );
+}
+
+
+
+================================================
+FILE: Hotel_Booking/src/index.css
+================================================
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
+
+/* ==============================
+   CSS Custom Properties / Design Tokens
+   ============================== */
+:root {
+  /* Colors */
+  --color-primary: #1a56db;
+  --color-primary-light: #3b82f6;
+  --color-primary-dark: #1e40af;
+  --color-primary-50: #eff6ff;
+  --color-primary-100: #dbeafe;
+  --color-primary-600: #2563eb;
+  --color-primary-700: #1d4ed8;
+
+  --color-secondary: #7c3aed;
+  --color-secondary-light: #a78bfa;
+
+  --color-accent: #f59e0b;
+  --color-accent-light: #fbbf24;
+
+  --color-success: #059669;
+  --color-success-light: #d1fae5;
+  --color-success-dark: #047857;
+
+  --color-error: #dc2626;
+  --color-error-light: #fee2e2;
+  --color-error-bg: #fef2f2;
+
+  --color-warning: #d97706;
+
+  /* Neutrals */
+  --color-bg: #f8fafc;
+  --color-surface: #ffffff;
+  --color-surface-hover: #f1f5f9;
+  --color-border: #e2e8f0;
+  --color-border-light: #f1f5f9;
+
+  --color-text-primary: #0f172a;
+  --color-text-secondary: #475569;
+  --color-text-muted: #94a3b8;
+  --color-text-inverse: #ffffff;
+
+  /* Typography */
+  --font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --font-size-xs: 0.75rem;
+  --font-size-sm: 0.875rem;
+  --font-size-base: 1rem;
+  --font-size-lg: 1.125rem;
+  --font-size-xl: 1.25rem;
+  --font-size-2xl: 1.5rem;
+  --font-size-3xl: 1.875rem;
+  --font-size-4xl: 2.25rem;
+
+  /* Spacing */
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.25rem;
+  --space-6: 1.5rem;
+  --space-8: 2rem;
+  --space-10: 2.5rem;
+  --space-12: 3rem;
+  --space-16: 4rem;
+
+  /* Border Radius */
+  --radius-sm: 0.375rem;
+  --radius-md: 0.5rem;
+  --radius-lg: 0.75rem;
+  --radius-xl: 1rem;
+  --radius-2xl: 1.5rem;
+  --radius-full: 9999px;
+
+  /* Shadows */
+  --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.05);
+  --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.07), 0 2px 4px -2px rgba(0, 0, 0, 0.05);
+  --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.08), 0 4px 6px -4px rgba(0, 0, 0, 0.04);
+  --shadow-xl: 0 20px 25px -5px rgba(0, 0, 0, 0.08), 0 8px 10px -6px rgba(0, 0, 0, 0.04);
+
+  /* Transitions */
+  --transition-fast: 150ms ease;
+  --transition-base: 200ms ease;
+  --transition-slow: 300ms ease;
+}
+
+/* ==============================
+   Global Reset & Base Styles
+   ============================== */
+*,
+*::before,
+*::after {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html {
+  font-size: 16px;
+  scroll-behavior: smooth;
+}
+
+body {
+  font-family: var(--font-family);
+  color: var(--color-text-primary);
+  background-color: var(--color-bg);
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  min-height: 100vh;
+}
+
+#root {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+a {
+  color: var(--color-primary);
+  text-decoration: none;
+  transition: color var(--transition-fast);
+}
+
+a:hover {
+  color: var(--color-primary-dark);
+}
+
+img {
+  max-width: 100%;
+  height: auto;
+  display: block;
+}
+
+/* ==============================
+   Navbar
+   ============================== */
+.navbar {
+  background: var(--color-surface);
+  border-bottom: 1px solid var(--color-border);
+  padding: var(--space-4) var(--space-6);
+  position: sticky;
+  top: 0;
+  z-index: 100;
+  backdrop-filter: blur(8px);
+  background: rgba(255, 255, 255, 0.95);
+}
+
+.navbar-container {
+  max-width: 1200px;
+  margin: 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.navbar-logo {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--font-size-xl);
+  font-weight: 700;
+  color: var(--color-primary);
+  text-decoration: none;
+}
+
+.navbar-logo:hover {
+  color: var(--color-primary-dark);
+}
+
+.navbar-logo-icon {
+  font-size: 1.5rem;
+}
+
+.navbar-links {
+  display: flex;
+  align-items: center;
+  gap: var(--space-6);
+}
+
+.navbar-link {
+  font-size: var(--font-size-sm);
+  font-weight: 500;
+  color: var(--color-text-secondary);
+  text-decoration: none;
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-md);
+  transition: all var(--transition-fast);
+}
+
+.navbar-link:hover {
+  color: var(--color-primary);
+  background-color: var(--color-primary-50);
+}
+
+.navbar-link.active {
+  color: var(--color-primary);
+  background-color: var(--color-primary-50);
+}
+
+/* ==============================
+   Page Container
+   ============================== */
+.page-container {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: var(--space-8) var(--space-6);
+  flex: 1;
+  width: 100%;
+}
+
+/* ==============================
+   Hero Section (Home Page)
+   ============================== */
+.hero-section {
+  text-align: center;
+  padding: var(--space-16) var(--space-6);
+  background: linear-gradient(135deg, #1e3a5f 0%, #1a56db 50%, #7c3aed 100%);
+  border-radius: var(--radius-2xl);
+  margin-bottom: var(--space-12);
+  position: relative;
+  overflow: hidden;
+}
+
+.hero-section::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: url("data:image/svg+xml,%3Csvg width='60' height='60' viewBox='0 0 60 60' xmlns='http://www.w3.org/2000/svg'%3E%3Cg fill='none' fill-rule='evenodd'%3E%3Cg fill='%23ffffff' fill-opacity='0.05'%3E%3Cpath d='M36 34v-4h-2v4h-4v2h4v4h2v-4h4v-2h-4zm0-30V0h-2v4h-4v2h4v4h2V6h4V4h-4zM6 34v-4H4v4H0v2h4v4h2v-4h4v-2H6zM6 4V0H4v4H0v2h4v4h2V6h4V4H6z'/%3E%3C/g%3E%3C/g%3E%3C/svg%3E");
+  opacity: 0.5;
+}
+
+.hero-content {
+  position: relative;
+  z-index: 1;
+}
+
+.hero-title {
+  font-size: var(--font-size-4xl);
+  font-weight: 800;
+  color: var(--color-text-inverse);
+  margin-bottom: var(--space-3);
+  letter-spacing: -0.025em;
+}
+
+.hero-subtitle {
+  font-size: var(--font-size-lg);
+  color: rgba(255, 255, 255, 0.85);
+  margin-bottom: var(--space-8);
+  font-weight: 400;
+}
+
+/* ==============================
+   Search Form
+   ============================== */
+.search-form-card {
+  background: var(--color-surface);
+  border-radius: var(--radius-xl);
+  padding: var(--space-8);
+  box-shadow: var(--shadow-xl);
+  max-width: 700px;
+  margin: 0 auto;
+}
+
+.search-form-title {
+  font-size: var(--font-size-2xl);
+  font-weight: 700;
+  color: var(--color-text-primary);
+  margin-bottom: var(--space-6);
+  text-align: center;
+}
+
+.form-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--space-5);
+}
+
+.form-group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.form-group.full-width {
+  grid-column: 1 / -1;
+}
+
+.form-label {
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  color: var(--color-text-secondary);
+  letter-spacing: 0.01em;
+}
+
+.form-input {
+  padding: var(--space-3) var(--space-4);
+  border: 1.5px solid var(--color-border);
+  border-radius: var(--radius-md);
+  font-size: var(--font-size-base);
+  font-family: var(--font-family);
+  color: var(--color-text-primary);
+  background: var(--color-surface);
+  transition: all var(--transition-fast);
+  width: 100%;
+}
+
+.form-input:focus {
+  outline: none;
+  border-color: var(--color-primary-light);
+  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.15);
+}
+
+.form-input.error {
+  border-color: var(--color-error);
+  box-shadow: 0 0 0 3px rgba(220, 38, 38, 0.1);
+}
+
+.form-input::placeholder {
+  color: var(--color-text-muted);
+}
+
+.form-textarea {
+  resize: vertical;
+  min-height: 100px;
+}
+
+.form-error {
+  font-size: var(--font-size-xs);
+  color: var(--color-error);
+  font-weight: 500;
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  margin-top: var(--space-1);
+}
+
+.form-error::before {
+  content: 'âš ';
+  font-size: 0.7rem;
+}
+
+/* ==============================
+   Buttons
+   ============================== */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-6);
+  border: none;
+  border-radius: var(--radius-md);
+  font-size: var(--font-size-base);
+  font-weight: 600;
+  font-family: var(--font-family);
+  cursor: pointer;
+  transition: all var(--transition-fast);
+  text-decoration: none;
+  line-height: 1.5;
+}
+
+.btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.btn-primary {
+  background: linear-gradient(135deg, var(--color-primary) 0%, var(--color-primary-600) 100%);
+  color: var(--color-text-inverse);
+  box-shadow: 0 2px 4px rgba(26, 86, 219, 0.3);
+}
+
+.btn-primary:hover:not(:disabled) {
+  background: linear-gradient(135deg, var(--color-primary-dark) 0%, var(--color-primary-700) 100%);
+  box-shadow: 0 4px 8px rgba(26, 86, 219, 0.4);
+  transform: translateY(-1px);
+}
+
+.btn-secondary {
+  background: var(--color-surface);
+  color: var(--color-primary);
+  border: 1.5px solid var(--color-primary-light);
+}
+
+.btn-secondary:hover:not(:disabled) {
+  background: var(--color-primary-50);
+}
+
+.btn-large {
+  padding: var(--space-4) var(--space-8);
+  font-size: var(--font-size-lg);
+  border-radius: var(--radius-lg);
+}
+
+.btn-full {
+  width: 100%;
+}
+
+.btn-success {
+  background: linear-gradient(135deg, var(--color-success) 0%, var(--color-success-dark) 100%);
+  color: var(--color-text-inverse);
+  box-shadow: 0 2px 4px rgba(5, 150, 105, 0.3);
+}
+
+.btn-success:hover:not(:disabled) {
+  box-shadow: 0 4px 8px rgba(5, 150, 105, 0.4);
+  transform: translateY(-1px);
+}
+
+.btn-back {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-sm);
+  font-weight: 500;
+  text-decoration: none;
+  margin-bottom: var(--space-6);
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-md);
+  transition: all var(--transition-fast);
+}
+
+.btn-back:hover {
+  color: var(--color-primary);
+  background: var(--color-primary-50);
+}
+
+/* ==============================
+   Room Cards
+   ============================== */
+.search-header {
+  margin-bottom: var(--space-8);
+}
+
+.search-title {
+  font-size: var(--font-size-3xl);
+  font-weight: 700;
+  color: var(--color-text-primary);
+  margin-bottom: var(--space-2);
+}
+
+.search-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-4);
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-sm);
+}
+
+.search-meta-item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  background: var(--color-primary-50);
+  padding: var(--space-1) var(--space-3);
+  border-radius: var(--radius-full);
+  font-weight: 500;
+  color: var(--color-primary-700);
+}
+
+.rooms-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+  gap: var(--space-6);
+}
+
+.room-card {
+  background: var(--color-surface);
+  border-radius: var(--radius-xl);
+  overflow: hidden;
+  box-shadow: var(--shadow-md);
+  transition: all var(--transition-base);
+  border: 1px solid var(--color-border-light);
+}
+
+.room-card:hover {
+  box-shadow: var(--shadow-xl);
+  transform: translateY(-4px);
+}
+
+.room-card-image {
+  width: 100%;
+  height: 200px;
+  object-fit: cover;
+  background: linear-gradient(135deg, #e2e8f0 0%, #cbd5e1 100%);
+}
+
+.room-card-body {
+  padding: var(--space-5);
+}
+
+.room-card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  margin-bottom: var(--space-2);
+}
+
+.room-card-name {
+  font-size: var(--font-size-xl);
+  font-weight: 700;
+  color: var(--color-text-primary);
+}
+
+.room-card-rating {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  background: var(--color-accent);
+  color: #fff;
+  padding: var(--space-1) var(--space-2);
+  border-radius: var(--radius-md);
+  font-size: var(--font-size-xs);
+  font-weight: 700;
+}
+
+.room-card-type {
+  font-size: var(--font-size-sm);
+  color: var(--color-text-secondary);
+  margin-bottom: var(--space-3);
+}
+
+.room-card-price {
+  font-size: var(--font-size-2xl);
+  font-weight: 800;
+  color: var(--color-primary);
+  margin-bottom: var(--space-3);
+}
+
+.room-card-price span {
+  font-size: var(--font-size-sm);
+  font-weight: 400;
+  color: var(--color-text-muted);
+}
+
+.room-card-amenities {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-bottom: var(--space-5);
+  list-style: none;
+}
+
+.amenity-tag {
+  background: var(--color-bg);
+  color: var(--color-text-secondary);
+  padding: var(--space-1) var(--space-3);
+  border-radius: var(--radius-full);
+  font-size: var(--font-size-xs);
+  font-weight: 500;
+  border: 1px solid var(--color-border);
+}
+
+/* ==============================
+   Room Details Page
+   ============================== */
+.room-details {
+  max-width: 900px;
+  margin: 0 auto;
+}
+
+.room-details-image {
+  width: 100%;
+  height: 400px;
+  object-fit: cover;
+  border-radius: var(--radius-xl);
+  margin-bottom: var(--space-8);
+  box-shadow: var(--shadow-lg);
+}
+
+.room-details-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  margin-bottom: var(--space-4);
+  flex-wrap: wrap;
+  gap: var(--space-4);
+}
+
+.room-details-info h1 {
+  font-size: var(--font-size-3xl);
+  font-weight: 800;
+  color: var(--color-text-primary);
+  margin-bottom: var(--space-1);
+}
+
+.room-details-type {
+  font-size: var(--font-size-lg);
+  color: var(--color-text-secondary);
+  font-weight: 500;
+}
+
+.room-details-price-card {
+  background: linear-gradient(135deg, var(--color-primary) 0%, var(--color-secondary) 100%);
+  color: var(--color-text-inverse);
+  padding: var(--space-5) var(--space-6);
+  border-radius: var(--radius-xl);
+  text-align: center;
+  min-width: 180px;
+}
+
+.room-details-price {
+  font-size: var(--font-size-3xl);
+  font-weight: 800;
+}
+
+.room-details-price-label {
+  font-size: var(--font-size-sm);
+  opacity: 0.85;
+}
+
+.room-details-description {
+  font-size: var(--font-size-lg);
+  color: var(--color-text-secondary);
+  line-height: 1.8;
+  margin-bottom: var(--space-8);
+  padding: var(--space-6);
+  background: var(--color-bg);
+  border-radius: var(--radius-lg);
+}
+
+.room-details-amenities-title {
+  font-size: var(--font-size-xl);
+  font-weight: 700;
+  color: var(--color-text-primary);
+  margin-bottom: var(--space-4);
+}
+
+.room-details-amenities {
+  list-style: none;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: var(--space-3);
+  margin-bottom: var(--space-8);
+}
+
+.room-details-amenity {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  font-weight: 500;
+  color: var(--color-text-secondary);
+}
+
+.amenity-check {
+  color: var(--color-success);
+  font-weight: 700;
+}
+
+/* ==============================
+   Booking Form Page
+   ============================== */
+.booking-page {
+  max-width: 800px;
+  margin: 0 auto;
+}
+
+.booking-room-summary {
+  display: flex;
+  gap: var(--space-6);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-xl);
+  padding: var(--space-5);
+  margin-bottom: var(--space-8);
+  align-items: center;
+}
+
+.booking-room-image {
+  width: 160px;
+  height: 110px;
+  object-fit: cover;
+  border-radius: var(--radius-lg);
+  flex-shrink: 0;
+}
+
+.booking-room-info h2 {
+  font-size: var(--font-size-xl);
+  font-weight: 700;
+  margin-bottom: var(--space-1);
+}
+
+.booking-room-info p {
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-sm);
+}
+
+.booking-room-info .price-tag {
+  font-size: var(--font-size-lg);
+  font-weight: 700;
+  color: var(--color-primary);
+  margin-top: var(--space-2);
+}
+
+.booking-form-card {
+  background: var(--color-surface);
+  border-radius: var(--radius-xl);
+  padding: var(--space-8);
+  box-shadow: var(--shadow-md);
+  border: 1px solid var(--color-border-light);
+}
+
+.form-section-title {
+  font-size: var(--font-size-lg);
+  font-weight: 700;
+  color: var(--color-text-primary);
+  margin-bottom: var(--space-5);
+  padding-bottom: var(--space-3);
+  border-bottom: 2px solid var(--color-primary-100);
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.form-section-icon {
+  font-size: 1.2rem;
+}
+
+.form-section {
+  margin-bottom: var(--space-8);
+}
+
+/* ==============================
+   Confirmation Page
+   ============================== */
+.confirmation-page {
+  max-width: 650px;
+  margin: 0 auto;
+  text-align: center;
+}
+
+.confirmation-card {
+  background: var(--color-surface);
+  border-radius: var(--radius-2xl);
+  padding: var(--space-12) var(--space-8);
+  box-shadow: var(--shadow-xl);
+  border: 1px solid var(--color-border-light);
+}
+
+.confirmation-icon {
+  font-size: 4rem;
+  margin-bottom: var(--space-4);
+}
+
+.confirmation-title {
+  font-size: var(--font-size-3xl);
+  font-weight: 800;
+  color: var(--color-text-primary);
+  margin-bottom: var(--space-2);
+}
+
+.confirmation-subtitle {
+  font-size: var(--font-size-lg);
+  color: var(--color-text-secondary);
+  margin-bottom: var(--space-8);
+}
+
+.confirmation-details {
+  background: var(--color-bg);
+  border-radius: var(--radius-xl);
+  padding: var(--space-6);
+  margin-bottom: var(--space-8);
+  text-align: left;
+}
+
+.confirmation-detail-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: var(--space-3) 0;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.confirmation-detail-row:last-child {
+  border-bottom: none;
+}
+
+.confirmation-detail-label {
+  font-size: var(--font-size-sm);
+  color: var(--color-text-muted);
+  font-weight: 500;
+}
+
+.confirmation-detail-value {
+  font-weight: 600;
+  color: var(--color-text-primary);
+}
+
+.confirmation-reference {
+  background: linear-gradient(135deg, var(--color-primary-50) 0%, #ede9fe 100%);
+  border: 2px dashed var(--color-primary-light);
+  border-radius: var(--radius-xl);
+  padding: var(--space-6);
+  margin-bottom: var(--space-8);
+}
+
+.confirmation-reference-label {
+  font-size: var(--font-size-sm);
+  color: var(--color-text-secondary);
+  font-weight: 500;
+  margin-bottom: var(--space-2);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.confirmation-reference-number {
+  font-size: var(--font-size-3xl);
+  font-weight: 800;
+  color: var(--color-primary);
+  letter-spacing: 0.05em;
+}
+
+.confirmation-status {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  background: var(--color-success-light);
+  color: var(--color-success);
+  padding: var(--space-2) var(--space-4);
+  border-radius: var(--radius-full);
+  font-weight: 600;
+  font-size: var(--font-size-sm);
+  margin-bottom: var(--space-6);
+}
+
+/* ==============================
+   Bookings List Page
+   ============================== */
+.bookings-title {
+  font-size: var(--font-size-3xl);
+  font-weight: 700;
+  color: var(--color-text-primary);
+  margin-bottom: var(--space-8);
+}
+
+.bookings-grid {
+  display: grid;
+  gap: var(--space-5);
+}
+
+.booking-card {
+  background: var(--color-surface);
+  border-radius: var(--radius-xl);
+  padding: var(--space-6);
+  box-shadow: var(--shadow-md);
+  border: 1px solid var(--color-border-light);
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: var(--space-4);
+  align-items: start;
+  transition: box-shadow var(--transition-base);
+}
+
+.booking-card:hover {
+  box-shadow: var(--shadow-lg);
+}
+
+.booking-card-info {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.booking-card-ref {
+  font-size: var(--font-size-xs);
+  font-weight: 700;
+  color: var(--color-primary);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.booking-card-hotel {
+  font-size: var(--font-size-xl);
+  font-weight: 700;
+  color: var(--color-text-primary);
+}
+
+.booking-card-room {
+  font-size: var(--font-size-sm);
+  color: var(--color-text-secondary);
+}
+
+.booking-card-dates {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--font-size-sm);
+  color: var(--color-text-secondary);
+  font-weight: 500;
+}
+
+.booking-card-guests {
+  font-size: var(--font-size-sm);
+  color: var(--color-text-secondary);
+}
+
+.booking-card-status {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  background: var(--color-success-light);
+  color: var(--color-success);
+  padding: var(--space-1) var(--space-3);
+  border-radius: var(--radius-full);
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+  white-space: nowrap;
+  align-self: start;
+}
+
+/* ==============================
+   Empty State
+   ============================== */
+.empty-state {
+  text-align: center;
+  padding: var(--space-16) var(--space-6);
+}
+
+.empty-state-icon {
+  font-size: 4rem;
+  margin-bottom: var(--space-4);
+  opacity: 0.5;
+}
+
+.empty-state-title {
+  font-size: var(--font-size-xl);
+  font-weight: 600;
+  color: var(--color-text-secondary);
+  margin-bottom: var(--space-2);
+}
+
+.empty-state-text {
+  color: var(--color-text-muted);
+  margin-bottom: var(--space-6);
+}
+
+/* ==============================
+   Error / Not Found
+   ============================== */
+.not-found {
+  text-align: center;
+  padding: var(--space-16) var(--space-6);
+}
+
+.not-found-icon {
+  font-size: 4rem;
+  margin-bottom: var(--space-4);
+}
+
+.not-found-title {
+  font-size: var(--font-size-2xl);
+  font-weight: 700;
+  color: var(--color-text-primary);
+  margin-bottom: var(--space-3);
+}
+
+.not-found-text {
+  color: var(--color-text-secondary);
+  margin-bottom: var(--space-6);
+}
+
+/* ==============================
+   Footer
+   ============================== */
+.footer {
+  background: var(--color-surface);
+  border-top: 1px solid var(--color-border);
+  padding: var(--space-6);
+  text-align: center;
+  color: var(--color-text-muted);
+  font-size: var(--font-size-sm);
+  margin-top: auto;
+}
+
+/* ==============================
+   Responsive Design
+   ============================== */
+@media (max-width: 768px) {
+  .hero-section {
+    padding: var(--space-10) var(--space-4);
+  }
+
+  .hero-title {
+    font-size: var(--font-size-2xl);
+  }
+
+  .hero-subtitle {
+    font-size: var(--font-size-base);
+  }
+
+  .search-form-card {
+    padding: var(--space-5);
+  }
+
+  .form-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .rooms-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .room-details-header {
+    flex-direction: column;
+  }
+
+  .room-details-image {
+    height: 250px;
+  }
+
+  .room-details-amenities {
+    grid-template-columns: 1fr;
+  }
+
+  .booking-room-summary {
+    flex-direction: column;
+  }
+
+  .booking-room-image {
+    width: 100%;
+    height: 150px;
+  }
+
+  .booking-form-card {
+    padding: var(--space-5);
+  }
+
+  .booking-card {
+    grid-template-columns: 1fr;
+  }
+
+  .confirmation-card {
+    padding: var(--space-8) var(--space-5);
+  }
+
+  .confirmation-reference-number {
+    font-size: var(--font-size-2xl);
+  }
+
+  .navbar-container {
+    flex-direction: column;
+    gap: var(--space-3);
+  }
+}
+
+@media (max-width: 480px) {
+  .page-container {
+    padding: var(--space-4) var(--space-3);
+  }
+
+  .search-meta {
+    flex-direction: column;
+    gap: var(--space-2);
+  }
+
+  .hero-title {
+    font-size: var(--font-size-xl);
+  }
+}
+
+
+
+================================================
+FILE: Hotel_Booking/src/main.jsx
+================================================
+import { StrictMode } from 'react'
+import { createRoot } from 'react-dom/client'
+import App from './App.jsx'
+
+createRoot(document.getElementById('root')).render(
+  <StrictMode>
+    <App />
+  </StrictMode>,
+)
+
+
+
+================================================
+FILE: Hotel_Booking/src/components/BookingCard.jsx
+================================================
+import { formatDateShort } from '../utils/formatDate';
+
+export default function BookingCard({ booking }) {
+  const testIdSuffix = booking.referenceNumber || booking.id;
+
+  return (
+    <article
+      className="booking-card"
+      data-testid={`booking-card-${testIdSuffix}`}
+    >
+      <div className="booking-card-info">
+        <span className="booking-card-ref">
+          Booking: {booking.referenceNumber}
+        </span>
+        <h3 className="booking-card-hotel">{booking.hotelName}</h3>
+        <p className="booking-card-room">{booking.roomType}</p>
+        <p className="booking-card-dates">
+          ðŸ“… {formatDateShort(booking.checkIn)} â†’ {formatDateShort(booking.checkOut)}
+        </p>
+        <p className="booking-card-guests">
+          ðŸ‘¥ {booking.guests} {booking.guests === 1 ? 'Guest' : 'Guests'}
+        </p>
+      </div>
+      <span className="booking-card-status">
+        âœ“ {booking.bookingStatus}
+      </span>
+    </article>
+  );
+}
+
+
+
+================================================
+FILE: Hotel_Booking/src/components/BookingForm.jsx
+================================================
+import { useState } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { validateBookingForm } from '../utils/validation';
+import { saveBooking } from '../utils/bookingStorage';
+import ErrorMessage from './ErrorMessage';
+
+export default function BookingForm({ room }) {
+  const navigate = useNavigate();
+  const [formData, setFormData] = useState({
+    firstName: '',
+    lastName: '',
+    email: '',
+    phone: '',
+    checkIn: '',
+    checkOut: '',
+    guests: '',
+    specialRequests: '',
+    cardNumber: '',
+    expiry: '',
+    cvv: ''
+  });
+  const [errors, setErrors] = useState({});
+
+  const handleChange = (e) => {
+    const { name, value } = e.target;
+    setFormData(prev => ({ ...prev, [name]: value }));
+    if (errors[name]) {
+      setErrors(prev => ({ ...prev, [name]: '' }));
+    }
+  };
+
+  const handleSubmit = (e) => {
+    e.preventDefault();
+
+    const validationErrors = validateBookingForm(formData);
+
+    if (Object.keys(validationErrors).length > 0) {
+      setErrors(validationErrors);
+      return;
+    }
+
+    // Create and save booking
+    const booking = {
+      roomId: room.id,
+      hotelName: room.name,
+      roomType: room.roomType,
+      firstName: formData.firstName.trim(),
+      lastName: formData.lastName.trim(),
+      email: formData.email.trim(),
+      phone: formData.phone.trim(),
+      checkIn: formData.checkIn,
+      checkOut: formData.checkOut,
+      guests: Number(formData.guests),
+      specialRequests: formData.specialRequests.trim()
+    };
+
+    const savedBooking = saveBooking(booking);
+
+    if (savedBooking) {
+      // Store the last booking reference for the confirmation page
+      sessionStorage.setItem('lastBooking', JSON.stringify(savedBooking));
+      navigate('/confirmation');
+    }
+  };
+
+  return (
+    <form className="booking-form-card" onSubmit={handleSubmit} noValidate>
+      {/* Guest Information */}
+      <div className="form-section">
+        <h3 className="form-section-title">
+          <span className="form-section-icon">ðŸ‘¤</span>
+          Guest Information
+        </h3>
+        <div className="form-grid">
+          <div className="form-group">
+            <label className="form-label" htmlFor="firstName">First Name</label>
+            <input
+              id="firstName"
+              name="firstName"
+              type="text"
+              className={`form-input ${errors.firstName ? 'error' : ''}`}
+              placeholder="John"
+              value={formData.firstName}
+              onChange={handleChange}
+              data-testid="first-name-input"
+              autoComplete="given-name"
+            />
+            <ErrorMessage message={errors.firstName} testId="first-name-error" />
+          </div>
+
+          <div className="form-group">
+            <label className="form-label" htmlFor="lastName">Last Name</label>
+            <input
+              id="lastName"
+              name="lastName"
+              type="text"
+              className={`form-input ${errors.lastName ? 'error' : ''}`}
+              placeholder="Doe"
+              value={formData.lastName}
+              onChange={handleChange}
+              data-testid="last-name-input"
+              autoComplete="family-name"
+            />
+            <ErrorMessage message={errors.lastName} testId="last-name-error" />
+          </div>
+
+          <div className="form-group">
+            <label className="form-label" htmlFor="email">Email</label>
+            <input
+              id="email"
+              name="email"
+              type="email"
+              className={`form-input ${errors.email ? 'error' : ''}`}
+              placeholder="john@example.com"
+              value={formData.email}
+              onChange={handleChange}
+              data-testid="email-input"
+              autoComplete="email"
+            />
+            <ErrorMessage message={errors.email} testId="email-error" />
+          </div>
+
+          <div className="form-group">
+            <label className="form-label" htmlFor="phone">Phone</label>
+            <input
+              id="phone"
+              name="phone"
+              type="tel"
+              className={`form-input ${errors.phone ? 'error' : ''}`}
+              placeholder="1234567890"
+              value={formData.phone}
+              onChange={handleChange}
+              data-testid="phone-input"
+              autoComplete="tel"
+            />
+            <ErrorMessage message={errors.phone} testId="phone-error" />
+          </div>
+        </div>
+      </div>
+
+      {/* Stay Details */}
+      <div className="form-section">
+        <h3 className="form-section-title">
+          <span className="form-section-icon">ðŸ“…</span>
+          Stay Details
+        </h3>
+        <div className="form-grid">
+          <div className="form-group">
+            <label className="form-label" htmlFor="bookingCheckIn">Check-in Date</label>
+            <input
+              id="bookingCheckIn"
+              name="checkIn"
+              type="date"
+              className={`form-input ${errors.checkIn ? 'error' : ''}`}
+              value={formData.checkIn}
+              onChange={handleChange}
+              data-testid="booking-checkin-input"
+            />
+            <ErrorMessage message={errors.checkIn} testId="booking-checkin-error" />
+          </div>
+
+          <div className="form-group">
+            <label className="form-label" htmlFor="bookingCheckOut">Check-out Date</label>
+            <input
+              id="bookingCheckOut"
+              name="checkOut"
+              type="date"
+              className={`form-input ${errors.checkOut ? 'error' : ''}`}
+              value={formData.checkOut}
+              onChange={handleChange}
+              data-testid="booking-checkout-input"
+            />
+            <ErrorMessage message={errors.checkOut} testId="booking-checkout-error" />
+          </div>
+
+          <div className="form-group">
+            <label className="form-label" htmlFor="bookingGuests">Number of Guests</label>
+            <input
+              id="bookingGuests"
+              name="guests"
+              type="number"
+              min="1"
+              max="10"
+              className={`form-input ${errors.guests ? 'error' : ''}`}
+              placeholder="Number of guests"
+              value={formData.guests}
+              onChange={handleChange}
+              data-testid="booking-guests-input"
+            />
+            <ErrorMessage message={errors.guests} testId="booking-guests-error" />
+          </div>
+
+          <div className="form-group full-width">
+            <label className="form-label" htmlFor="specialRequests">Special Requests (Optional)</label>
+            <textarea
+              id="specialRequests"
+              name="specialRequests"
+              className={`form-input form-textarea ${errors.specialRequests ? 'error' : ''}`}
+              placeholder="Any special requirements or preferences..."
+              value={formData.specialRequests}
+              onChange={handleChange}
+              data-testid="special-requests-input"
+              maxLength={500}
+            />
+            <ErrorMessage message={errors.specialRequests} testId="special-requests-error" />
+            <p style={{ fontSize: '0.75rem', color: '#94a3b8', marginTop: '0.25rem' }}>
+              {formData.specialRequests.length}/500 characters
+            </p>
+          </div>
+        </div>
+      </div>
+
+      {/* Payment Information */}
+      <div className="form-section">
+        <h3 className="form-section-title">
+          <span className="form-section-icon">ðŸ’³</span>
+          Payment Information
+        </h3>
+        <div className="form-grid">
+          <div className="form-group full-width">
+            <label className="form-label" htmlFor="cardNumber">Card Number</label>
+            <input
+              id="cardNumber"
+              name="cardNumber"
+              type="text"
+              className={`form-input ${errors.cardNumber ? 'error' : ''}`}
+              placeholder="1234567890123456"
+              value={formData.cardNumber}
+              onChange={handleChange}
+              data-testid="card-number-input"
+              autoComplete="cc-number"
+              maxLength={16}
+            />
+            <ErrorMessage message={errors.cardNumber} testId="card-error" />
+          </div>
+
+          <div className="form-group">
+            <label className="form-label" htmlFor="expiry">Expiry Date</label>
+            <input
+              id="expiry"
+              name="expiry"
+              type="text"
+              className={`form-input ${errors.expiry ? 'error' : ''}`}
+              placeholder="MM/YY"
+              value={formData.expiry}
+              onChange={handleChange}
+              data-testid="expiry-input"
+              autoComplete="cc-exp"
+              maxLength={5}
+            />
+            <ErrorMessage message={errors.expiry} testId="expiry-error" />
+          </div>
+
+          <div className="form-group">
+            <label className="form-label" htmlFor="cvv">CVV</label>
+            <input
+              id="cvv"
+              name="cvv"
+              type="text"
+              className={`form-input ${errors.cvv ? 'error' : ''}`}
+              placeholder="123"
+              value={formData.cvv}
+              onChange={handleChange}
+              data-testid="cvv-input"
+              autoComplete="cc-csc"
+              maxLength={3}
+            />
+            <ErrorMessage message={errors.cvv} testId="cvv-error" />
+          </div>
+        </div>
+      </div>
+
+      <button
+        type="submit"
+        className="btn btn-success btn-large btn-full"
+        data-testid="confirm-booking-button"
+      >
+        âœ“ Confirm Booking
+      </button>
+    </form>
+  );
+}
+
+
+
+================================================
+FILE: Hotel_Booking/src/components/ErrorMessage.jsx
+================================================
+export default function ErrorMessage({ message, testId }) {
+  if (!message) return null;
+
+  return (
+    <p className="form-error" data-testid={testId} role="alert">
+      {message}
+    </p>
+  );
+}
+
+
+
+================================================
+FILE: Hotel_Booking/src/components/Navbar.jsx
+================================================
+import { Link, NavLink } from 'react-router-dom';
+
+export default function Navbar() {
+  return (
+    <nav className="navbar" data-testid="navbar">
+      <div className="navbar-container">
+        <Link to="/" className="navbar-logo" data-testid="navbar-logo">
+          <span className="navbar-logo-icon">🏨</span>
+          StayBooker
+        </Link>
+        <div className="navbar-links">
+          <NavLink
+            to="/"
+            end
+            className={({ isActive }) => `navbar-link ${isActive ? 'active' : ''}`}
+            data-testid="nav-home"
+          >
+            Home
+          </NavLink>
+          <NavLink
+            to="/bookings"
+            className={({ isActive }) => `navbar-link ${isActive ? 'active' : ''}`}
+            data-testid="nav-bookings"
+          >
+            My Bookings
+          </NavLink>
+        </div>
+      </div>
+    </nav>
+  );
+}
+
+
+
+================================================
+FILE: Hotel_Booking/src/components/RoomCard.jsx
+================================================
+import { Link } from 'react-router-dom';
+
+export default function RoomCard({ room }) {
+  return (
+    <article className="room-card" data-testid={`room-card-${room.id}`}>
+      <img
+        className="room-card-image"
+        src={room.image}
+        alt={`${room.name} - ${room.roomType}`}
+        loading="lazy"
+      />
+      <div className="room-card-body">
+        <div className="room-card-header">
+          <h3 className="room-card-name">{room.name}</h3>
+          <span className="room-card-rating">
+            ⭐ {room.rating}
+          </span>
+        </div>
+        <p className="room-card-type">{room.roomType}</p>
+        <p className="room-card-price">
+          ${room.price} <span>/ night</span>
+        </p>
+        <ul className="room-card-amenities" aria-label="Amenities">
+          {room.amenities.map((amenity, index) => (
+            <li key={index} className="amenity-tag">{amenity}</li>
+          ))}
+        </ul>
+        <Link
+          to={`/room/${room.id}`}
+          className="btn btn-primary btn-full"
+          data-testid={`view-details-${room.id}`}
+        >
+          View Details
+        </Link>
+      </div>
+    </article>
+  );
+}
+
+
+
+================================================
+FILE: Hotel_Booking/src/components/SearchForm.jsx
+================================================
+import { useState } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { validateSearchForm } from '../utils/validation';
+import ErrorMessage from './ErrorMessage';
+
+export default function SearchForm() {
+  const navigate = useNavigate();
+  const [formData, setFormData] = useState({
+    city: '',
+    checkIn: '',
+    checkOut: '',
+    guests: ''
+  });
+  const [errors, setErrors] = useState({});
+
+  const handleChange = (e) => {
+    const { name, value } = e.target;
+    setFormData(prev => ({ ...prev, [name]: value }));
+    // Clear error for this field when user starts typing
+    if (errors[name]) {
+      setErrors(prev => ({ ...prev, [name]: '' }));
+    }
+  };
+
+  const handleSubmit = (e) => {
+    e.preventDefault();
+
+    const validationErrors = validateSearchForm({
+      city: formData.city,
+      checkIn: formData.checkIn,
+      checkOut: formData.checkOut,
+      guests: formData.guests
+    });
+
+    if (Object.keys(validationErrors).length > 0) {
+      setErrors(validationErrors);
+      return;
+    }
+
+    // Navigate with query parameters
+    const params = new URLSearchParams({
+      city: formData.city.trim(),
+      checkIn: formData.checkIn,
+      checkOut: formData.checkOut,
+      guests: formData.guests
+    });
+
+    navigate(`/search?${params.toString()}`);
+  };
+
+  return (
+    <form className="search-form-card" onSubmit={handleSubmit} noValidate>
+      <h2 className="search-form-title">Find Your Perfect Stay</h2>
+      <div className="form-grid">
+        <div className="form-group full-width">
+          <label className="form-label" htmlFor="city">City</label>
+          <input
+            id="city"
+            name="city"
+            type="text"
+            className={`form-input ${errors.city ? 'error' : ''}`}
+            placeholder="Where are you going?"
+            value={formData.city}
+            onChange={handleChange}
+            data-testid="city-input"
+            autoComplete="off"
+          />
+          <ErrorMessage message={errors.city} testId="city-error" />
+        </div>
+
+        <div className="form-group">
+          <label className="form-label" htmlFor="checkIn">Check-in</label>
+          <input
+            id="checkIn"
+            name="checkIn"
+            type="date"
+            className={`form-input ${errors.checkIn ? 'error' : ''}`}
+            value={formData.checkIn}
+            onChange={handleChange}
+            data-testid="checkin-input"
+          />
+          <ErrorMessage message={errors.checkIn} testId="checkin-error" />
+        </div>
+
+        <div className="form-group">
+          <label className="form-label" htmlFor="checkOut">Check-out</label>
+          <input
+            id="checkOut"
+            name="checkOut"
+            type="date"
+            className={`form-input ${errors.checkOut ? 'error' : ''}`}
+            value={formData.checkOut}
+            onChange={handleChange}
+            data-testid="checkout-input"
+          />
+          <ErrorMessage message={errors.checkOut} testId="checkout-error" />
+        </div>
+
+        <div className="form-group">
+          <label className="form-label" htmlFor="guests">Guests</label>
+          <input
+            id="guests"
+            name="guests"
+            type="number"
+            min="1"
+            max="10"
+            className={`form-input ${errors.guests ? 'error' : ''}`}
+            placeholder="Number of guests"
+            value={formData.guests}
+            onChange={handleChange}
+            data-testid="guests-input"
+          />
+          <ErrorMessage message={errors.guests} testId="guests-error" />
+        </div>
+
+        <div className="form-group full-width">
+          <button
+            type="submit"
+            className="btn btn-primary btn-large btn-full"
+            data-testid="search-button"
+          >
+            🔍 Search Hotels
+          </button>
+        </div>
+      </div>
+    </form>
+  );
+}
+
+
+
+================================================
+FILE: Hotel_Booking/src/data/rooms.js
+================================================
+const rooms = [
+  {
+    id: 1,
+    name: "Grand Hotel",
+    roomType: "Deluxe Room",
+    price: 150,
+    rating: 4.8,
+    image: "https://images.unsplash.com/photo-1566073771259-6a8506099945?w=600&h=400&fit=crop",
+    description: "Experience luxury in our beautifully appointed Deluxe Room featuring elegant dÃ©cor, premium bedding, and stunning city views.",
+    amenities: ["WiFi", "TV", "Breakfast", "Air Conditioning", "Mini Bar", "Room Service"]
+  },
+  {
+    id: 2,
+    name: "City Hotel",
+    roomType: "Standard Room",
+    price: 100,
+    rating: 4.2,
+    image: "https://images.unsplash.com/photo-1551882547-ff40c63fe5fa?w=600&h=400&fit=crop",
+    description: "A comfortable and well-equipped Standard Room perfect for both business and leisure travelers.",
+    amenities: ["WiFi", "AC", "TV", "Parking"]
+  },
+  {
+    id: 3,
+    name: "Royal Palace",
+    roomType: "Premium Suite",
+    price: 250,
+    rating: 4.9,
+    image: "https://images.unsplash.com/photo-1582719478250-c89cae4dc85b?w=600&h=400&fit=crop",
+    description: "Indulge in the ultimate luxury experience with our Premium Suite, featuring a separate living area, spa bath, and panoramic views.",
+    amenities: ["WiFi", "TV", "Breakfast", "Pool", "Air Conditioning", "Spa", "Gym", "Room Service"]
+  },
+  {
+    id: 4,
+    name: "Seaside Resort",
+    roomType: "Ocean View Room",
+    price: 200,
+    rating: 4.6,
+    image: "https://images.unsplash.com/photo-1520250497591-112f2f40a3f4?w=600&h=400&fit=crop",
+    description: "Wake up to breathtaking ocean views in this beautifully designed room with modern amenities and coastal charm.",
+    amenities: ["WiFi", "TV", "Breakfast", "Pool", "Air Conditioning", "Beach Access"]
+  },
+  {
+    id: 5,
+    name: "Mountain Lodge",
+    roomType: "Cabin Suite",
+    price: 180,
+    rating: 4.7,
+    image: "https://images.unsplash.com/photo-1596394516093-501ba68a0ba6?w=600&h=400&fit=crop",
+    description: "Escape to nature in our cozy Cabin Suite featuring rustic elegance, a fireplace, and stunning mountain views.",
+    amenities: ["WiFi", "TV", "Breakfast", "Fireplace", "Hiking Trails", "Parking"]
+  }
+];
+
+export default rooms;
+
+
+
+================================================
+FILE: Hotel_Booking/src/pages/Booking.jsx
+================================================
+import { useParams, Link } from 'react-router-dom';
+import rooms from '../data/rooms';
+import BookingForm from '../components/BookingForm';
+
+export default function Booking() {
+  const { id } = useParams();
+  const room = rooms.find(r => r.id === Number(id));
+
+  if (!room) {
+    return (
+      <div className="booking-page" data-testid="booking-page">
+        <div className="not-found">
+          <div className="not-found-icon">🚫</div>
+          <h1 className="not-found-title">Room not found</h1>
+          <p className="not-found-text">
+            The room you&apos;re trying to book doesn&apos;t exist.
+          </p>
+          <Link to="/search" className="btn btn-primary" data-testid="back-to-search">
+            ← Back to Search
+          </Link>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="booking-page" data-testid="booking-page">
+      <Link to={`/room/${room.id}`} className="btn-back" data-testid="back-to-room">
+        ← Back to Room Details
+      </Link>
+
+      <h1 style={{ fontSize: '1.875rem', fontWeight: 800, marginBottom: '1.5rem' }}>
+        Complete Your Booking
+      </h1>
+
+      <div className="booking-room-summary" data-testid="booking-room-summary">
+        <img
+          className="booking-room-image"
+          src={room.image}
+          alt={`${room.name} - ${room.roomType}`}
+        />
+        <div className="booking-room-info">
+          <h2>{room.name}</h2>
+          <p>{room.roomType}</p>
+          <p className="price-tag">${room.price} / night</p>
+        </div>
+      </div>
+
+      <BookingForm room={room} />
+    </div>
+  );
+}
+
+
+
+================================================
+FILE: Hotel_Booking/src/pages/Bookings.jsx
+================================================
+import { useState, useEffect } from 'react';
+import { Link } from 'react-router-dom';
+import { getBookings } from '../utils/bookingStorage';
+import BookingCard from '../components/BookingCard';
+
+export default function Bookings() {
+  const [bookings, setBookings] = useState([]);
+
+  useEffect(() => {
+    const storedBookings = getBookings();
+    // Show newest first
+    setBookings(storedBookings.reverse());
+  }, []);
+
+  return (
+    <div data-testid="bookings-page">
+      <h1 className="bookings-title">My Bookings</h1>
+
+      {bookings.length === 0 ? (
+        <div className="empty-state" data-testid="no-bookings">
+          <div className="empty-state-icon">ðŸ“‹</div>
+          <h2 className="empty-state-title">No bookings found.</h2>
+          <p className="empty-state-text">
+            You haven&apos;t made any bookings yet. Start exploring hotels!
+          </p>
+          <Link to="/" className="btn btn-primary" data-testid="start-booking">
+            Find Hotels
+          </Link>
+        </div>
+      ) : (
+        <div className="bookings-grid">
+          {bookings.map((booking) => (
+            <BookingCard
+              key={booking.id}
+              booking={booking}
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+
+================================================
+FILE: Hotel_Booking/src/pages/Confirmation.jsx
+================================================
+import { useEffect, useState } from 'react';
+import { Link, useNavigate } from 'react-router-dom';
+import { formatDate } from '../utils/formatDate';
+
+export default function Confirmation() {
+  const [booking, setBooking] = useState(null);
+  const navigate = useNavigate();
+
+  useEffect(() => {
+    try {
+      const lastBooking = sessionStorage.getItem('lastBooking');
+      if (lastBooking) {
+        setBooking(JSON.parse(lastBooking));
+      }
+    } catch (error) {
+      console.error('Error reading last booking:', error);
+    }
+  }, []);
+
+  if (!booking) {
+    return (
+      <div className="confirmation-page" data-testid="confirmation-page">
+        <div className="not-found">
+          <div className="not-found-icon">❓</div>
+          <h1 className="not-found-title">No booking found</h1>
+          <p className="not-found-text">
+            There is no recent booking to confirm. Please make a booking first.
+          </p>
+          <Link to="/" className="btn btn-primary" data-testid="back-to-home">
+            ← Back to Home
+          </Link>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="confirmation-page" data-testid="confirmation-page">
+      <div className="confirmation-card" data-testid="booking-confirmation">
+        <div className="confirmation-icon">🎉</div>
+        <h1 className="confirmation-title">Booking Confirmed!</h1>
+        <p className="confirmation-subtitle">
+          Thank you, {booking.firstName}! Your reservation has been confirmed.
+        </p>
+
+        <div className="confirmation-status">
+          ✓ {booking.bookingStatus}
+        </div>
+
+        <div className="confirmation-details">
+          <div className="confirmation-detail-row">
+            <span className="confirmation-detail-label">Hotel</span>
+            <span className="confirmation-detail-value">{booking.hotelName}</span>
+          </div>
+          <div className="confirmation-detail-row">
+            <span className="confirmation-detail-label">Room Type</span>
+            <span className="confirmation-detail-value">{booking.roomType}</span>
+          </div>
+          <div className="confirmation-detail-row">
+            <span className="confirmation-detail-label">Check-in</span>
+            <span className="confirmation-detail-value">{formatDate(booking.checkIn)}</span>
+          </div>
+          <div className="confirmation-detail-row">
+            <span className="confirmation-detail-label">Check-out</span>
+            <span className="confirmation-detail-value">{formatDate(booking.checkOut)}</span>
+          </div>
+          <div className="confirmation-detail-row">
+            <span className="confirmation-detail-label">Guests</span>
+            <span className="confirmation-detail-value">
+              {booking.guests} {booking.guests === 1 ? 'Guest' : 'Guests'}
+            </span>
+          </div>
+          <div className="confirmation-detail-row">
+            <span className="confirmation-detail-label">Guest</span>
+            <span className="confirmation-detail-value">
+              {booking.firstName} {booking.lastName}
+            </span>
+          </div>
+        </div>
+
+        <div className="confirmation-reference">
+          <p className="confirmation-reference-label">Booking Reference</p>
+          <p className="confirmation-reference-number" data-testid="booking-reference">
+            {booking.referenceNumber}
+          </p>
+        </div>
+
+        <Link
+          to="/bookings"
+          className="btn btn-primary btn-large"
+          data-testid="view-bookings-button"
+        >
+          View My Bookings
+        </Link>
+      </div>
+    </div>
+  );
+}
+
+
+
+================================================
+FILE: Hotel_Booking/src/pages/Home.jsx
+================================================
+import SearchForm from '../components/SearchForm';
+
+export default function Home() {
+  return (
+    <div data-testid="home-page">
+      <section className="hero-section">
+        <div className="hero-content">
+          <h1 className="hero-title">Find Your Perfect Stay</h1>
+          <p className="hero-subtitle">
+            Discover amazing hotels at the best prices. Book your dream getaway today.
+          </p>
+        </div>
+      </section>
+      <SearchForm />
+    </div>
+  );
+}
+
+
+
+================================================
+FILE: Hotel_Booking/src/pages/RoomDetails.jsx
+================================================
+import { useParams, Link } from 'react-router-dom';
+import rooms from '../data/rooms';
+
+export default function RoomDetails() {
+  const { id } = useParams();
+  const room = rooms.find(r => r.id === Number(id));
+
+  if (!room) {
+    return (
+      <div data-testid="room-details-page">
+        <div className="not-found">
+          <div className="not-found-icon">🚫</div>
+          <h1 className="not-found-title">Room not found</h1>
+          <p className="not-found-text">
+            The room you&apos;re looking for doesn&apos;t exist or has been removed.
+          </p>
+          <Link to="/search" className="btn btn-primary" data-testid="back-to-search">
+            ← Back to Search
+          </Link>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="room-details" data-testid="room-details-page">
+      <Link to="/search" className="btn-back" data-testid="back-to-search">
+        ← Back to Search Results
+      </Link>
+
+      <img
+        className="room-details-image"
+        src={room.image}
+        alt={`${room.name} - ${room.roomType}`}
+      />
+
+      <div className="room-details-header">
+        <div className="room-details-info">
+          <h1 data-testid="room-name">{room.name}</h1>
+          <p className="room-details-type" data-testid="room-type">{room.roomType}</p>
+        </div>
+        <div className="room-details-price-card">
+          <div className="room-details-price" data-testid="room-price">${room.price}</div>
+          <div className="room-details-price-label">per night</div>
+        </div>
+      </div>
+
+      <p className="room-details-description">{room.description}</p>
+
+      <h2 className="room-details-amenities-title">Amenities</h2>
+      <ul className="room-details-amenities" data-testid="amenities-list">
+        {room.amenities.map((amenity, index) => (
+          <li key={index} className="room-details-amenity">
+            <span className="amenity-check">✓</span>
+            {amenity}
+          </li>
+        ))}
+      </ul>
+
+      <Link
+        to={`/book/${room.id}`}
+        className="btn btn-success btn-large btn-full"
+        data-testid="book-now-button"
+      >
+        Book Now
+      </Link>
+    </div>
+  );
+}
+
+
+
+================================================
+FILE: Hotel_Booking/src/pages/SearchResults.jsx
+================================================
+import { useSearchParams, Link } from 'react-router-dom';
+import rooms from '../data/rooms';
+import RoomCard from '../components/RoomCard';
+import { formatDate } from '../utils/formatDate';
+
+export default function SearchResults() {
+  const [searchParams] = useSearchParams();
+
+  const city = searchParams.get('city') || '';
+  const checkIn = searchParams.get('checkIn') || '';
+  const checkOut = searchParams.get('checkOut') || '';
+  const guests = searchParams.get('guests') || '';
+
+  const hasValidParams = city && checkIn && checkOut && guests;
+
+  if (!hasValidParams) {
+    return (
+      <div data-testid="search-results-page">
+        <div className="not-found">
+          <div className="not-found-icon">🔍</div>
+          <h1 className="not-found-title">Please enter valid search details.</h1>
+          <p className="not-found-text">
+            Use the search form to find available hotels.
+          </p>
+          <Link to="/" className="btn btn-primary" data-testid="back-to-home">
+            ← Back to Home
+          </Link>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div data-testid="search-results-page">
+      <Link to="/" className="btn-back" data-testid="back-to-home">
+        ← Back to Home
+      </Link>
+
+      <div className="search-header">
+        <h1 className="search-title">Search Results</h1>
+        <div className="search-meta">
+          <span className="search-meta-item">📍 {city}</span>
+          <span className="search-meta-item">📅 {formatDate(checkIn)} → {formatDate(checkOut)}</span>
+          <span className="search-meta-item">👥 {guests} {Number(guests) === 1 ? 'Guest' : 'Guests'}</span>
+        </div>
+      </div>
+
+      <div className="rooms-grid" data-testid="rooms-list">
+        {rooms.map(room => (
+          <RoomCard key={room.id} room={room} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+
+
+================================================
+FILE: Hotel_Booking/src/utils/bookingStorage.js
+================================================
+/**
+ * Booking storage utility for localStorage operations.
+ * Uses the key "hotelBookings" for all booking data.
+ */
+
+const STORAGE_KEY = 'hotelBookings';
+
+/**
+ * Generates a unique booking reference in the format BK-XXXXXX.
+ * @returns {string} A booking reference like "BK-928341"
+ */
+export function generateBookingReference() {
+  const digits = Math.floor(100000 + Math.random() * 900000);
+  return `BK-${digits}`;
+}
+
+/**
+ * Retrieves all bookings from localStorage.
+ * @returns {Array} Array of booking objects
+ */
+export function getBookings() {
+  try {
+    const data = localStorage.getItem(STORAGE_KEY);
+    if (!data) return [];
+    return JSON.parse(data);
+  } catch (error) {
+    console.error('Error reading bookings from localStorage:', error);
+    return [];
+  }
+}
+
+/**
+ * Saves a new booking to localStorage.
+ * @param {object} booking - The booking object to save
+ * @returns {object} The saved booking with id and reference number
+ */
+export function saveBooking(booking) {
+  try {
+    const bookings = getBookings();
+    const newBooking = {
+      ...booking,
+      id: Date.now(),
+      referenceNumber: generateBookingReference(),
+      bookingStatus: 'Confirmed',
+      createdAt: new Date().toISOString()
+    };
+    bookings.push(newBooking);
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(bookings));
+    return newBooking;
+  } catch (error) {
+    console.error('Error saving booking to localStorage:', error);
+    return null;
+  }
+}
+
+/**
+ * Gets a single booking by its reference number.
+ * @param {string} referenceNumber - The booking reference to find
+ * @returns {object|null} The booking object or null
+ */
+export function getBookingByReference(referenceNumber) {
+  const bookings = getBookings();
+  return bookings.find(b => b.referenceNumber === referenceNumber) || null;
+}
+
+
+
+================================================
+FILE: Hotel_Booking/src/utils/formatDate.js
+================================================
+/**
+ * Formats a date string (YYYY-MM-DD) into a readable format (e.g., "20 Sep 2026").
+ * @param {string} dateString - ISO date string
+ * @returns {string} Formatted date
+ */
+export function formatDate(dateString) {
+  if (!dateString) return '';
+  const date = new Date(dateString + 'T00:00:00');
+  return date.toLocaleDateString('en-GB', {
+    day: 'numeric',
+    month: 'short',
+    year: 'numeric'
+  });
+}
+
+/**
+ * Formats a short date (e.g., "20 Sep").
+ * @param {string} dateString - ISO date string
+ * @returns {string} Short formatted date
+ */
+export function formatDateShort(dateString) {
+  if (!dateString) return '';
+  const date = new Date(dateString + 'T00:00:00');
+  return date.toLocaleDateString('en-GB', {
+    day: 'numeric',
+    month: 'short'
+  });
+}
+
+
+
+================================================
+FILE: Hotel_Booking/src/utils/validation.js
+================================================
+/**
+ * Validation utility functions for the Hotel Booking application.
+ * All validation is deterministic and predictable for Playwright testing.
+ */
+
+/**
+ * Validates the home search form fields.
+ * @param {object} values - { city, checkIn, checkOut, guests }
+ * @returns {object} errors - keyed by field name
+ */
+export function validateSearchForm(values) {
+  const errors = {};
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+
+  // City
+  if (!values.city || values.city.trim() === '') {
+    errors.city = 'City is required.';
+  }
+
+  // Check-in
+  if (!values.checkIn) {
+    errors.checkIn = 'Check-in date is required.';
+  } else {
+    const checkInDate = new Date(values.checkIn);
+    checkInDate.setHours(0, 0, 0, 0);
+    if (checkInDate < today) {
+      errors.checkIn = 'Check-in date must be today or a future date.';
+    }
+  }
+
+  // Check-out
+  if (!values.checkOut) {
+    errors.checkOut = 'Check-out date is required.';
+  } else if (values.checkIn) {
+    const checkInDate = new Date(values.checkIn);
+    const checkOutDate = new Date(values.checkOut);
+    checkInDate.setHours(0, 0, 0, 0);
+    checkOutDate.setHours(0, 0, 0, 0);
+    if (checkOutDate <= checkInDate) {
+      errors.checkOut = 'Check-out date must be after check-in date.';
+    }
+  }
+
+  // Guests
+  if (!values.guests && values.guests !== 0) {
+    errors.guests = 'Number of guests is required.';
+  } else {
+    const guestsNum = Number(values.guests);
+    if (isNaN(guestsNum) || guestsNum < 1 || guestsNum > 10) {
+      errors.guests = 'Number of guests must be between 1 and 10.';
+    }
+  }
+
+  return errors;
+}
+
+/**
+ * Validates the booking form fields.
+ * @param {object} values - all booking form fields
+ * @returns {object} errors - keyed by field name
+ */
+export function validateBookingForm(values) {
+  const errors = {};
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+
+  // First Name
+  if (!values.firstName || values.firstName.trim() === '') {
+    errors.firstName = 'First name is required.';
+  } else if (values.firstName.trim().length < 2) {
+    errors.firstName = 'First name must be at least 2 characters.';
+  }
+
+  // Last Name
+  if (!values.lastName || values.lastName.trim() === '') {
+    errors.lastName = 'Last name is required.';
+  } else if (values.lastName.trim().length < 2) {
+    errors.lastName = 'Last name must be at least 2 characters.';
+  }
+
+  // Email
+  if (!values.email || values.email.trim() === '') {
+    errors.email = 'Email is required.';
+  } else {
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(values.email.trim())) {
+      errors.email = 'Please enter a valid email address.';
+    }
+  }
+
+  // Phone
+  if (!values.phone || values.phone.trim() === '') {
+    errors.phone = 'Phone number is required.';
+  } else {
+    const phoneDigits = values.phone.trim();
+    if (/[^0-9]/.test(phoneDigits)) {
+      errors.phone = 'Phone number must contain only digits.';
+    } else if (phoneDigits.length !== 10) {
+      errors.phone = 'Phone number must contain exactly 10 digits.';
+    }
+  }
+
+  // Check-in
+  if (!values.checkIn) {
+    errors.checkIn = 'Check-in date is required.';
+  } else {
+    const checkInDate = new Date(values.checkIn);
+    checkInDate.setHours(0, 0, 0, 0);
+    if (checkInDate < today) {
+      errors.checkIn = 'Check-in date must be today or a future date.';
+    }
+  }
+
+  // Check-out
+  if (!values.checkOut) {
+    errors.checkOut = 'Check-out date is required.';
+  } else if (values.checkIn) {
+    const checkInDate = new Date(values.checkIn);
+    const checkOutDate = new Date(values.checkOut);
+    checkInDate.setHours(0, 0, 0, 0);
+    checkOutDate.setHours(0, 0, 0, 0);
+    if (checkOutDate <= checkInDate) {
+      errors.checkOut = 'Check-out date must be after check-in date.';
+    }
+  }
+
+  // Guests
+  if (!values.guests && values.guests !== 0) {
+    errors.guests = 'Number of guests is required.';
+  } else {
+    const guestsNum = Number(values.guests);
+    if (isNaN(guestsNum) || !Number.isInteger(guestsNum) || guestsNum < 1 || guestsNum > 10) {
+      errors.guests = 'Number of guests must be between 1 and 10.';
+    }
+  }
+
+  // Special Requests
+  if (values.specialRequests && values.specialRequests.length > 500) {
+    errors.specialRequests = 'Special requests must be 500 characters or fewer.';
+  }
+
+  // Card Number
+  if (!values.cardNumber || values.cardNumber.trim() === '') {
+    errors.cardNumber = 'Card number is required.';
+  } else {
+    const cardDigits = values.cardNumber.trim().replace(/\s/g, '');
+    if (/[^0-9]/.test(cardDigits)) {
+      errors.cardNumber = 'Card number must contain only digits.';
+    } else if (cardDigits.length !== 16) {
+      errors.cardNumber = 'Card number must contain exactly 16 digits.';
+    }
+  }
+
+  // Expiry
+  if (!values.expiry || values.expiry.trim() === '') {
+    errors.expiry = 'Expiry date is required.';
+  } else {
+    const expiryRegex = /^(0[1-9]|1[0-2])\/([0-9]{2})$/;
+    const match = values.expiry.trim().match(expiryRegex);
+    if (!match) {
+      errors.expiry = 'Expiry date must be in MM/YY format.';
+    } else {
+      const month = parseInt(match[1], 10);
+      const year = parseInt(match[2], 10) + 2000;
+      const now = new Date();
+      const currentMonth = now.getMonth() + 1;
+      const currentYear = now.getFullYear();
+      if (year < currentYear || (year === currentYear && month < currentMonth)) {
+        errors.expiry = 'Card has expired.';
+      }
+    }
+  }
+
+  // CVV
+  if (!values.cvv || values.cvv.trim() === '') {
+    errors.cvv = 'CVV is required.';
+  } else {
+    const cvvDigits = values.cvv.trim();
+    if (/[^0-9]/.test(cvvDigits)) {
+      errors.cvv = 'CVV must contain only digits.';
+    } else if (cvvDigits.length !== 3) {
+      errors.cvv = 'CVV must contain exactly 3 digits.';
+    }
+  }
+
+  return errors;
+}
+
+
+
+================================================
+FILE: test_cases/sample_test_cases.xlsx
+================================================
+[Non-text file]
+

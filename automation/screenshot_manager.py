@@ -31,26 +31,69 @@ def _normalize_label(test_id: str, label: str) -> str:
     return _safe(label)
 
 
-def _try_scroll_into_view(page: Page, test_id: str) -> bool:
+# ---------------------------------------------------------------------------
+# Focus / scroll helpers  (the real Bug #1 fix for small error elements)
+# ---------------------------------------------------------------------------
+def _candidate_testids(test_id: str) -> list[str]:
     """
-    Scroll the element with the given data-testid into the viewport.
-    This is the *real* Bug #1 fix: without it, Playwright auto-scrolls
-    to the submit button (bottom of the form) and any validation errors
-    rendered at the top of the form are simply not in the viewport when
-    the screenshot is taken.
+    Given a focus testid, return a list of fallbacks to try, in order.
+
+    For a validation-error testid like `booking-guests-error`, we also try
+    the corresponding input (`booking-guests-input`). Scrolling to the input
+    naturally shows the error message sitting directly beneath it, which is
+    a good second-best framing when the tiny error element itself is hard
+    to centre cleanly.
+    """
+    candidates = [test_id]
+    if test_id.endswith("-error"):
+        candidates.append(test_id[: -len("-error")] + "-input")
+    return candidates
+
+
+def _force_center_scroll(page: Page, test_id: str) -> bool:
+    """
+    Scroll the element with the given data-testid to the CENTRE of the
+    viewport.
+
+    Why centre and not 'into view'?
+      Playwright's default `scroll_into_view_if_needed()` uses the browser's
+      minimum-scroll behaviour. For a small element (like a one-line error
+      paragraph) this can leave the element pinned to the very bottom of
+      the viewport, clipped, or hidden behind the sticky navbar. Centring
+      guarantees it's fully visible regardless of viewport size.
+
+    Returns True on success, False if the element couldn't be found / shown.
     """
     try:
         loc = page.get_by_test_id(test_id).first
         if loc.count() == 0:
             return False
-        loc.scroll_into_view_if_needed(timeout=SCROLL_TIMEOUT_MS)
-        # Tiny buffer so the scroll position is reflected in the next paint.
+        # Ensure it's attached + visible before scrolling to it.
+        loc.wait_for(state="visible", timeout=SCROLL_TIMEOUT_MS)
+        loc.evaluate(
+            "el => el.scrollIntoView({block: 'center', inline: 'nearest', "
+            "behavior: 'instant'})"
+        )
         page.wait_for_timeout(SCROLL_SETTLE_MS)
         return True
     except Exception:
         return False
 
 
+def _focus_element(page: Page, test_id: str) -> None:
+    """Try each candidate testid in order; stop at first success."""
+    if not test_id:
+        return
+    for candidate in _candidate_testids(test_id):
+        if _force_center_scroll(page, candidate):
+            return
+    # If nothing worked, don't fail the screenshot - just proceed with the
+    # current viewport. (A missing focus target is not a test failure.)
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 def capture_screenshot(
     page: Page,
     test_id: str,
@@ -62,13 +105,11 @@ def capture_screenshot(
     Save a screenshot under:
         screenshots/run_<RUN_ID>/<test_id>/<test_id>_step-NN[_label].png
 
-    If `scroll_target` is provided, that element is scrolled into view
-    (and given a tiny settle buffer) before the screenshot is taken.
-
-    Returns the absolute path as a string (safe for JSON serialization).
+    If `scroll_target` is provided, that element (or a nearby fallback) is
+    centred in the viewport before the screenshot.
     """
     if SCROLL_BEFORE_SCREENSHOT and scroll_target:
-        _try_scroll_into_view(page, scroll_target)
+        _focus_element(page, scroll_target)
 
     test_dir = Path(SCREENSHOT_DIR) / test_id
     test_dir.mkdir(parents=True, exist_ok=True)

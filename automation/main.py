@@ -34,15 +34,14 @@ def _human_step_label(parsed: dict, raw: str) -> str:
 
 def _compute_scroll_target(parsed: dict, next_parsed: dict | None) -> str | None:
     """
-    Decide which element to focus before the screenshot.
+    Decide which element to focus *before* the screenshot for this step.
 
     Priority:
-      1. What the *next* step is waiting for (that's the freshly rendered
-         content produced by the current action). This is what makes the
-         validation-error screenshot land on the right element.
+      1. What the NEXT step is waiting for (that's the freshly rendered
+         content produced by the CURRENT action). This is what makes
+         validation-error screenshots land on the right element.
       2. Otherwise, this step's own target.
-      3. Otherwise, no scroll (OPEN -> top of page; SCREENSHOT -> leave the
-         viewport where the previous step put it).
+      3. Otherwise, None (SCREENSHOT and OPEN are handled by the caller).
     """
     cmd = parsed.get("command")
     if cmd == "OPEN":
@@ -55,7 +54,7 @@ def _compute_scroll_target(parsed: dict, next_parsed: dict | None) -> str | None
                "ASSERT_TEXT", "SELECT", "CLEAR"):
         return parsed.get("target")
 
-    return None  # SCREENSHOT or unknown
+    return None  # SCREENSHOT handled separately by the caller
 
 
 def _briefly_settle_for_failure(page) -> None:
@@ -88,16 +87,35 @@ def run_one_test(browser, test_case) -> TestExecutionResult:
 
     total = len(parsed_steps)
 
+    # Tracks the "focus element" carried across steps so SCREENSHOT steps
+    # inherit the previous step's framing (e.g. a validation error).
+    last_focus: str | None = None
+
     for idx, (raw_step, parsed) in enumerate(parsed_steps, start=1):
         next_parsed = parsed_steps[idx][1] if idx < total else None
+        cmd = parsed.get("command")
 
         sr = StepResult(
             step_number=idx,
-            command=parsed.get("command", "?"),
+            command=cmd or "?",
             raw_step=raw_step,
             target=parsed.get("target"),
             value=parsed.get("value"),
         )
+
+        # --- Decide what the viewport should focus on for THIS step -------
+        if cmd == "OPEN":
+            # New page load -> reset focus, show top of page.
+            last_focus = None
+            scroll_target = None
+        elif cmd == "SCREENSHOT":
+            # Reuse the previous step's focus so we don't drift away from
+            # the element the test just validated.
+            scroll_target = last_focus
+        else:
+            scroll_target = _compute_scroll_target(parsed, next_parsed)
+            if scroll_target:
+                last_focus = scroll_target
 
         step_start = time.perf_counter()
         try:
@@ -107,14 +125,12 @@ def run_one_test(browser, test_case) -> TestExecutionResult:
             # 2. Wait for the app to reach a relevant, stable state (Bug #1 fix)
             settle_after_step(page, parsed, next_parsed)
 
-            # 3. Screenshot after EVERY step. Scroll the focus element
-            #    into the viewport first, otherwise top-of-form errors are
-            #    invisible when Playwright auto-scrolled to the submit button.
+            # 3. Screenshot after EVERY step. Centre-scroll the focus element
+            #    so small validation errors are always fully visible.
             label = ""
-            if parsed.get("command") == "SCREENSHOT" and parsed.get("target"):
+            if cmd == "SCREENSHOT" and parsed.get("target"):
                 label = parsed["target"]
 
-            scroll_target = _compute_scroll_target(parsed, next_parsed)
             sr.screenshot_path = capture_screenshot(
                 page, test_case.test_id, idx, label, scroll_target=scroll_target
             )
@@ -126,15 +142,14 @@ def run_one_test(browser, test_case) -> TestExecutionResult:
             sr.status = "FAIL"
             sr.error_message = str(e)
             test_status = "FAIL"
-            failure_reason = f"Step {idx} ({parsed.get('command')}): {e}"
+            failure_reason = f"Step {idx} ({cmd}): {e}"
 
-            # Failure screenshot - still try to scroll to the failure target
+            # Failure screenshot - still try to centre on the failure target.
             _briefly_settle_for_failure(page)
             try:
-                fail_scroll = parsed.get("target")
                 sr.screenshot_path = capture_screenshot(
                     page, test_case.test_id, idx, "FAILED",
-                    scroll_target=fail_scroll,
+                    scroll_target=parsed.get("target") or last_focus,
                 )
             except Exception:
                 pass
@@ -179,7 +194,7 @@ def run_one_test(browser, test_case) -> TestExecutionResult:
 # ---------------------------------------------------------------------------
 def run_tests() -> list[TestExecutionResult]:
     print("=" * 60)
-    print("AI HOTEL TEST AUTOMATION - PART 3 (Stage 1.1)")
+    print("AI HOTEL TEST AUTOMATION - PART 3 (Stage 1.2)")
     print("=" * 60)
     print(f"Excel:     {EXCEL_FILE}")
     print(f"Base URL:  {BASE_URL}")

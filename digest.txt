@@ -1,6 +1,7 @@
 Directory structure:
 └── AI Automation - Datakernels/
     ├── automation/
+    │   ├── ai_verifier.py
     │   ├── config.py
     │   ├── excel_reader.py
     │   ├── executor.py
@@ -45,27 +46,89 @@ Directory structure:
         └── sample_test_cases.xlsx
 
 ================================================
+FILE: automation/ai_verifier.py
+================================================
+"""
+Placeholder interface for AI Vision verification (Part 3 Stage 2).
+
+Do NOT call any real AI here yet. This file only defines the shape of the
+future integration so that Stage 2 can plug in without touching main.py.
+"""
+from dataclasses import dataclass
+from typing import Optional
+
+
+@dataclass
+class AIVerification:
+    status: str = "NOT RUN"            # PASS / FAIL / UNCERTAIN / NOT RUN
+    confidence: Optional[float] = None  # 0.0 - 1.0
+    observation: Optional[str] = None
+
+
+def verify_step(
+    screenshot_path: str,
+    step_command: str,
+    expected_result: str,
+) -> AIVerification:
+    """
+    Stage 2 will replace this body with a structured-prompt call to a Vision API.
+    For now: explicitly signal that verification has not run.
+    """
+    return AIVerification(
+        status="NOT RUN",
+        confidence=None,
+        observation="AI verification not implemented yet (Part 3 Stage 2).",
+    )
+
+
+================================================
 FILE: automation/config.py
 ================================================
-import os
+from pathlib import Path
+from datetime import datetime
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.dirname(BASE_DIR)
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+BASE_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = BASE_DIR.parent
 
 BASE_URL = "http://localhost:5173"
-DEFAULT_TIMEOUT = 10000
-MAX_RETRIES = 1
-SCREENSHOT_DIR = os.path.join(PROJECT_ROOT, "screenshots")
-TEST_CASES_DIR = os.path.join(PROJECT_ROOT, "test_cases")
-EXCEL_FILE = os.path.join(TEST_CASES_DIR, "sample_test_cases.xlsx")
 
+# ---------------------------------------------------------------------------
+# Browser / timeouts
+# ---------------------------------------------------------------------------
+HEADLESS = False                       # set True for CI
+DEFAULT_TIMEOUT = 10_000               # ms - for elements we *know* must appear
+SHORT_TIMEOUT = 3_000                  # ms - for opportunistic / best-effort waits
+MAX_RETRIES = 1
+
+# ---------------------------------------------------------------------------
+# Wait tuning (Bug #1)
+# ---------------------------------------------------------------------------
+POST_ACTION_SETTLE_MS = 120            # tiny React re-render buffer after FILL
+NETWORK_IDLE_TIMEOUT_MS = 3_000        # bounded wait for background network
+ANIMATION_SETTLE_TIMEOUT_MS = 2_000    # bounded wait for CSS animations to end
+
+# ---------------------------------------------------------------------------
+# Per-run screenshot root - prevents overwriting previous runs
+# ---------------------------------------------------------------------------
+RUN_ID = datetime.now().strftime("%Y%m%d_%H%M%S")
+SCREENSHOT_DIR = PROJECT_ROOT / "screenshots" / f"run_{RUN_ID}"
+
+# ---------------------------------------------------------------------------
+# Excel test cases
+# ---------------------------------------------------------------------------
+TEST_CASES_DIR = PROJECT_ROOT / "test_cases"
+EXCEL_FILE = TEST_CASES_DIR / "sample_test_cases.xlsx"
 
 
 ================================================
 FILE: automation/excel_reader.py
 ================================================
-import os
+from pathlib import Path
 from openpyxl import load_workbook
+
 from models import TestCase
 from config import EXCEL_FILE
 
@@ -76,59 +139,79 @@ REQUIRED_COLUMNS = [
     "Steps",
     "Expected Result",
     "Status",
-    "AI Observation"
+    "AI Observation",
 ]
 
-def load_test_cases() -> list[TestCase]:
-    if not os.path.exists(EXCEL_FILE):
-        raise FileNotFoundError(f"Excel file not found at {EXCEL_FILE}")
 
-    wb = load_workbook(EXCEL_FILE)
+def load_test_cases() -> list[TestCase]:
+    excel_path = Path(EXCEL_FILE)
+    if not excel_path.exists():
+        raise FileNotFoundError(f"Excel file not found at {excel_path}")
+
+    wb = load_workbook(excel_path)
     sheet = wb.active
 
     headers = [cell.value for cell in sheet[1]]
-    
-    for col in REQUIRED_COLUMNS:
-        if col not in headers:
-            raise ValueError(f"Missing required column: {col}")
-
-    col_indices = {col: headers.index(col) for col in REQUIRED_COLUMNS}
-    test_cases = []
-
-    for row in sheet.iter_rows(min_row=2, values_only=True):
-        test_id = row[col_indices["Test ID"]]
-        if not test_id:
-            continue
-            
-        test_case = TestCase(
-            test_id=str(test_id),
-            test_name=str(row[col_indices["Test Name"]]),
-            category=str(row[col_indices["Category"]]),
-            raw_steps=str(row[col_indices["Steps"]]),
-            expected_result=str(row[col_indices["Expected Result"]]),
-            status=str(row[col_indices["Status"]] or "NOT RUN"),
-            ai_observation=str(row[col_indices["AI Observation"]]) if row[col_indices["AI Observation"]] else None
+    missing = [c for c in REQUIRED_COLUMNS if c not in headers]
+    if missing:
+        raise ValueError(
+            f"Missing required column(s): {', '.join(missing)}. "
+            f"Found columns: {headers}"
         )
-        test_cases.append(test_case)
+
+    col_idx = {c: headers.index(c) for c in REQUIRED_COLUMNS}
+    test_cases: list[TestCase] = []
+
+    for row_number, row in enumerate(
+        sheet.iter_rows(min_row=2, values_only=True), start=2
+    ):
+        test_id = row[col_idx["Test ID"]]
+        if test_id is None or str(test_id).strip() == "":
+            continue  # skip blank rows
+
+        raw_steps = row[col_idx["Steps"]]
+        if raw_steps is None or str(raw_steps).strip() == "":
+            raise ValueError(
+                f"Row {row_number}: Test '{test_id}' has empty Steps column."
+            )
+
+        test_cases.append(
+            TestCase(
+                test_id=str(test_id).strip(),
+                test_name=str(row[col_idx["Test Name"]] or "").strip(),
+                category=str(row[col_idx["Category"]] or "").strip(),
+                raw_steps=str(raw_steps),
+                expected_result=str(row[col_idx["Expected Result"]] or "").strip(),
+                status=str(row[col_idx["Status"]] or "NOT RUN").strip(),
+                ai_observation=(
+                    str(row[col_idx["AI Observation"]]).strip()
+                    if row[col_idx["AI Observation"]]
+                    else None
+                ),
+            )
+        )
+
+    if not test_cases:
+        raise ValueError("No test cases were found in the Excel file.")
 
     return test_cases
-
 
 
 ================================================
 FILE: automation/executor.py
 ================================================
-import traceback
 from playwright.sync_api import Page, expect
 from typing import Dict, Any
 
 from config import BASE_URL
-from waits import wait_for_visible
+from waits import wait_for_visible, wait_after_step
+
 
 def execute_step(page: Page, parsed_step: Dict[str, Any]) -> None:
     """
-    Executes a single parsed step using Playwright.
-    Raises an exception if the step fails.
+    Executes a single parsed step. Raises on failure.
+    (Unchanged from Part 2 except SCREENSHOT is documented as a no-op here -
+     the actual capture happens in main.py so that EVERY step gets a shot.)
     """
     command = parsed_step.get("command")
     target = parsed_step.get("target")
@@ -140,57 +223,54 @@ def execute_step(page: Page, parsed_step: Dict[str, Any]) -> None:
     if command == "OPEN":
         url = BASE_URL + (target if target else "/")
         page.goto(url)
-    
+
     elif command == "FILL":
         if not target:
             raise ValueError(f"Target missing for command {command}")
-        # value can be empty string in case of empty input validation
         val = value if value is not None else ""
-        locator = page.get_by_test_id(target)
-        locator.fill(val)
-        
+        page.get_by_test_id(target).fill(val)
+
     elif command == "CLICK":
         if not target:
             raise ValueError(f"Target missing for command {command}")
-        locator = page.get_by_test_id(target)
-        locator.click()
-        
+        page.get_by_test_id(target).click()
+
     elif command == "WAIT_FOR":
         if not target:
             raise ValueError(f"Target missing for command {command}")
         wait_for_visible(page, target)
-        
+
     elif command == "ASSERT_VISIBLE":
         if not target:
             raise ValueError(f"Target missing for command {command}")
-        locator = page.get_by_test_id(target)
-        expect(locator).to_be_visible()
-        
+        expect(page.get_by_test_id(target)).to_be_visible()
+
     elif command == "ASSERT_TEXT":
         if not target:
             raise ValueError(f"Target missing for command {command}")
-        locator = page.get_by_test_id(target)
-        expect(locator).to_contain_text(value if value else "")
-        
+        expect(page.get_by_test_id(target)).to_contain_text(value if value else "")
+
     elif command == "SELECT":
         if not target:
             raise ValueError(f"Target missing for command {command}")
-        locator = page.get_by_test_id(target)
-        locator.select_option(value)
-        
+        page.get_by_test_id(target).select_option(value)
+
     elif command == "CLEAR":
         if not target:
             raise ValueError(f"Target missing for command {command}")
-        locator = page.get_by_test_id(target)
-        locator.clear()
-        
+        page.get_by_test_id(target).clear()
+
     elif command == "SCREENSHOT":
-        # Handled by main runner logic since it needs test context (test_id, step_number)
+        # No-op here. main.py always captures a per-step screenshot.
         pass
-        
+
     else:
         raise ValueError(f"Unsupported command: {command}")
 
+
+def settle_after_step(page: Page, parsed: dict, next_parsed: dict | None = None) -> None:
+    """Public wrapper so main.py doesn't import waits directly (keeps coupling low)."""
+    wait_after_step(page, parsed, next_parsed)
 
 
 ================================================
@@ -377,147 +457,258 @@ if __name__ == "__main__":
 ================================================
 FILE: automation/main.py
 ================================================
-import traceback
+import time
+from pathlib import Path
+
 from playwright.sync_api import sync_playwright
 
+from config import (
+    BASE_URL,
+    EXCEL_FILE,
+    HEADLESS,
+    SCREENSHOT_DIR,
+)
 from excel_reader import load_test_cases
 from step_parser import parse_step
-from executor import execute_step
+from executor import execute_step, settle_after_step
 from screenshot_manager import capture_screenshot
-from models import TestExecutionResult
+from models import StepResult, TestExecutionResult
+from waits import wait_for_animations
 
-def run_tests():
-    print("=" * 40)
-    print("AI HOTEL TEST AUTOMATION")
-    print("=" * 40)
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def _human_step_label(parsed: dict, raw: str) -> str:
+    cmd = parsed.get("command", "?")
+    tgt = parsed.get("target")
+    val = parsed.get("value")
+    if cmd == "FILL" and tgt is not None:
+        return f"{cmd}: {tgt} = {val if val else ''}"
+    if tgt:
+        return f"{cmd}: {tgt}"
+    return raw.strip()
+
+
+def _briefly_settle_for_failure(page) -> None:
+    """Give the app a moment to render an error UI before the FAILED screenshot."""
+    try:
+        page.wait_for_timeout(200)
+        wait_for_animations(page, timeout=1_000)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Single test-case runner
+# ---------------------------------------------------------------------------
+def run_one_test(browser, test_case) -> TestExecutionResult:
+    context = browser.new_context()
+    page = context.new_page()
+
+    raw_lines = [ln for ln in test_case.raw_steps.splitlines() if ln.strip()]
+    parsed_steps = []
+    for line in raw_lines:
+        p = parse_step(line)
+        if p:
+            parsed_steps.append((line.strip(), p))
+
+    step_results: list[StepResult] = []
+    test_status = "PASS"
+    failure_reason = None
+    test_start = time.perf_counter()
+
+    total = len(parsed_steps)
+
+    for idx, (raw_step, parsed) in enumerate(parsed_steps, start=1):
+        next_parsed = parsed_steps[idx][1] if idx < total else None
+
+        sr = StepResult(
+            step_number=idx,
+            command=parsed.get("command", "?"),
+            raw_step=raw_step,
+            target=parsed.get("target"),
+            value=parsed.get("value"),
+        )
+
+        step_start = time.perf_counter()
+        try:
+            # 1. Execute the action
+            execute_step(page, parsed)
+
+            # 2. Wait for the app to reach a relevant, stable state (Bug #1 fix)
+            settle_after_step(page, parsed, next_parsed)
+
+            # 3. Screenshot after EVERY step
+            label = ""
+            if parsed.get("command") == "SCREENSHOT" and parsed.get("target"):
+                label = parsed["target"]
+            sr.screenshot_path = capture_screenshot(
+                page, test_case.test_id, idx, label
+            )
+
+            sr.status = "PASS"
+            print(f"  [OK]  Step {idx}/{total}  {_human_step_label(parsed, raw_step)}")
+
+        except Exception as e:
+            sr.status = "FAIL"
+            sr.error_message = str(e)
+            test_status = "FAIL"
+            failure_reason = (
+                f"Step {idx} ({parsed.get('command')}): {e}"
+            )
+
+            # Failure screenshot
+            _briefly_settle_for_failure(page)
+            try:
+                sr.screenshot_path = capture_screenshot(
+                    page, test_case.test_id, idx, "FAILED"
+                )
+            except Exception:
+                pass
+
+            print(f"  [FAIL] Step {idx}/{total}  {_human_step_label(parsed, raw_step)}")
+            print(f"         -> {e}")
+            if sr.screenshot_path:
+                print(f"         -> screenshot: {sr.screenshot_path}")
+
+        finally:
+            sr.duration_ms = int((time.perf_counter() - step_start) * 1000)
+            step_results.append(sr)
+
+        # Stop executing further steps of this test on failure, but
+        # DO NOT abort the whole run - the caller moves to the next test.
+        if sr.status == "FAIL":
+            break
+
+    test_duration_ms = int((time.perf_counter() - test_start) * 1000)
+
+    if test_status == "PASS":
+        print(f"  PASS  ({len(step_results)} steps, {test_duration_ms/1000:.1f}s)")
+    else:
+        print(f"  FAIL  ({len(step_results)} steps, {test_duration_ms/1000:.1f}s)")
+
+    context.close()
+
+    return TestExecutionResult(
+        test_id=test_case.test_id,
+        test_name=test_case.test_name,
+        category=test_case.category,
+        expected_result=test_case.expected_result,
+        status=test_status,
+        step_results=step_results,
+        failure_reason=failure_reason,
+        duration_ms=test_duration_ms,
+        ai_status="NOT RUN",
+        ai_observation=None,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+def run_tests() -> list[TestExecutionResult]:
+    print("=" * 60)
+    print("AI HOTEL TEST AUTOMATION - PART 3 (Stage 1)")
+    print("=" * 60)
+    print(f"Excel:     {EXCEL_FILE}")
+    print(f"Base URL:  {BASE_URL}")
+    print(f"Headless:  {HEADLESS}")
+    print(f"Run ID:    {Path(SCREENSHOT_DIR).name}")
+    print(f"Shots ->   {SCREENSHOT_DIR}")
     print("")
 
     try:
         test_cases = load_test_cases()
     except Exception as e:
-        print(f"Failed to load test cases: {e}")
-        return
+        print(f"[FATAL] Failed to load test cases: {e}")
+        return []
 
-    results = []
-    passed = 0
-    failed = 0
+    print(f"Tests found: {len(test_cases)}\n")
+
+    results: list[TestExecutionResult] = []
+    passed = failed = 0
 
     with sync_playwright() as p:
-        # Note: Set headless=False for manual verification, True for CI
-        browser = p.chromium.launch(headless=False)
-        
-        for test_case in test_cases:
-            print(f"Running {test_case.test_id}...")
-            
-            context = browser.new_context()
-            page = context.new_page()
-            
-            steps = test_case.raw_steps.strip().split('\n')
-            
-            test_status = "PASS"
-            test_error = None
-            executed_steps = []
-            test_screenshots = []
-            
-            step_number = 1
-            for raw_step in steps:
-                if not raw_step.strip():
-                    continue
-                    
-                parsed = parse_step(raw_step)
-                if not parsed:
-                    continue
+        try:
+            browser = p.chromium.launch(headless=HEADLESS)
+        except Exception as e:
+            print(f"[FATAL] Browser launch failed: {e}")
+            return []
 
-                step_result = {
-                    "step_number": step_number,
-                    "command": parsed.get("command"),
-                    "target": parsed.get("target"),
-                    "value": parsed.get("value"),
-                    "status": "PASS",
-                    "screenshot": None,
-                    "error": None
-                }
-                
-                try:
-                    execute_step(page, parsed)
-                    
-                    if parsed.get("command") == "SCREENSHOT":
-                        target_name = parsed.get("target", f"step_{step_number}")
-                        screenshot_path = capture_screenshot(page, test_case.test_id, step_number, target_name)
-                        step_result["screenshot"] = screenshot_path
-                        test_screenshots.append(screenshot_path)
-                    
-                except Exception as e:
-                    step_result["status"] = "FAIL"
-                    step_result["error"] = str(e)
-                    test_status = "FAIL"
-                    test_error = str(e)
-                    
-                    try:
-                        screenshot_path = capture_screenshot(page, test_case.test_id, step_number, "failure")
-                        step_result["screenshot"] = screenshot_path
-                        test_screenshots.append(screenshot_path)
-                    except:
-                        pass
-                        
-                    executed_steps.append(step_result)
-                    break
-                    
-                executed_steps.append(step_result)
-                step_number += 1
-                
-            print(test_status)
-            if test_status == "PASS":
+        for tc in test_cases:
+            print(f"Running {tc.test_id} - {tc.test_name}")
+            try:
+                result = run_one_test(browser, tc)
+            except Exception as e:
+                print(f"  [ERROR] {tc.test_id} crashed at orchestrator level: {e}")
+                result = TestExecutionResult(
+                    test_id=tc.test_id,
+                    test_name=tc.test_name,
+                    category=tc.category,
+                    expected_result=tc.expected_result,
+                    status="FAIL",
+                    step_results=[],
+                    failure_reason=f"Orchestrator error: {e}",
+                    ai_status="NOT RUN",
+                )
+            results.append(result)
+            if result.status == "PASS":
                 passed += 1
             else:
                 failed += 1
-                print(f"  Error: {test_error}")
-                
-            results.append(TestExecutionResult(
-                test_id=test_case.test_id,
-                test_name=test_case.test_name,
-                status=test_status,
-                expected_result=test_case.expected_result,
-                actual_result="Success" if test_status == "PASS" else test_error,
-                steps=executed_steps,
-                screenshots=test_screenshots,
-                error=test_error
-            ))
-            
-            context.close()
-            
+            print("")
+
         browser.close()
 
+    # ----- Summary ----------------------------------------------------------
+    print("=" * 60)
+    print("EXECUTION SUMMARY")
+    print("=" * 60)
+    print(f"Total:    {len(results)}")
+    print(f"Passed:   {passed}")
+    print(f"Failed:   {failed}")
+    print(f"Skipped:  0")
     print("")
-    print("=" * 40)
-    print("SUMMARY")
-    print("=" * 40)
-    print(f"Total Tests: {len(test_cases)}")
-    print(f"Passed: {passed}")
-    print(f"Failed: {failed}")
-    print("=" * 40)
-    print("Note: AI verification is not enabled in Part 2.")
+    print(f"Screenshots: {SCREENSHOT_DIR}")
+    print("AI Verification: NOT IMPLEMENTED YET (Part 3 Stage 2)")
+    print("=" * 60)
+
+    return results
+
 
 if __name__ == "__main__":
     run_tests()
-
 
 
 ================================================
 FILE: automation/models.py
 ================================================
 from dataclasses import dataclass, field
-from typing import List, Optional, Dict, Any
+from typing import List, Optional
+
 
 @dataclass
-class TestStep:
+class StepResult:
+    """Structured result for a single executed step.
+
+    This is the unit that Stage 2 (AI Vision) will consume.
+    """
     step_number: int
-    command: str
+    command: str                       # e.g. "CLICK", "FILL"
+    raw_step: str                      # original line from Excel
     target: Optional[str] = None
     value: Optional[str] = None
-    status: str = "NOT RUN"
-    screenshot: Optional[str] = None
-    error: Optional[str] = None
+    status: str = "NOT RUN"            # PASS / FAIL
+    screenshot_path: Optional[str] = None
+    error_message: Optional[str] = None
+    duration_ms: int = 0
+
+    # ---- AI hooks (Stage 2) ------------------------------------------------
+    ai_status: Optional[str] = None    # PASS / FAIL / UNCERTAIN / NOT RUN
+    ai_confidence: Optional[float] = None
+    ai_observation: Optional[str] = None
+
 
 @dataclass
 class TestCase:
@@ -528,31 +719,20 @@ class TestCase:
     expected_result: str
     status: str = "NOT RUN"
     ai_observation: Optional[str] = None
-    
-    # For execution
-    steps: List[TestStep] = field(default_factory=list)
-    actual_result: Optional[str] = None
-    screenshots: List[str] = field(default_factory=list)
-    error: Optional[str] = None
-    
-    # Part 3 placeholders
-    ai_status: Optional[str] = None
-    ai_confidence: Optional[str] = None
+
 
 @dataclass
 class TestExecutionResult:
     test_id: str
     test_name: str
-    status: str
+    category: str
     expected_result: str
-    actual_result: str
-    steps: List[Dict[str, Any]]
-    screenshots: List[str]
-    error: Optional[str]
+    status: str                        # PASS / FAIL
+    step_results: List[StepResult] = field(default_factory=list)
+    failure_reason: Optional[str] = None
+    duration_ms: int = 0
     ai_status: Optional[str] = None
-    ai_confidence: Optional[str] = None
     ai_observation: Optional[str] = None
-
 
 
 ================================================
@@ -565,27 +745,55 @@ openpyxl
 ================================================
 FILE: automation/screenshot_manager.py
 ================================================
-import os
+import re
+from pathlib import Path
+
 from playwright.sync_api import Page
+
 from config import SCREENSHOT_DIR
 
-def capture_screenshot(page: Page, test_id: str, step_number: int, step_name: str = "") -> str:
-    """
-    Captures a screenshot of the current page state.
-    Returns the absolute path to the saved screenshot.
-    """
-    test_dir = os.path.join(SCREENSHOT_DIR, test_id)
-    os.makedirs(test_dir, exist_ok=True)
-    
-    # Format: step-01.png or step-01_home.png
-    safe_step_name = f"_{step_name}" if step_name else ""
-    filename = f"step-{step_number:02d}{safe_step_name}.png"
-    filepath = os.path.join(test_dir, filename)
-    
-    page.screenshot(path=filepath, full_page=False)
-    
-    return filepath
+_INVALID = re.compile(r"[^A-Za-z0-9._-]+")
 
+
+def _safe(text: str) -> str:
+    return _INVALID.sub("_", text).strip("_")
+
+
+def _normalize_label(test_id: str, label: str) -> str:
+    """
+    Turn "TC-001_step-26_success" -> "success" so the final filename
+    stays clean:  TC-001_step-26_success.png
+    """
+    if not label:
+        return ""
+    prefix = f"{test_id}_"
+    if label.startswith(prefix):
+        label = label[len(prefix):]
+    label = re.sub(r"^step-\d+_?", "", label)
+    return _safe(label)
+
+
+def capture_screenshot(
+    page: Page,
+    test_id: str,
+    step_number: int,
+    label: str = "",
+) -> str:
+    """
+    Save a screenshot under:
+        screenshots/run_<RUN_ID>/<test_id>/<test_id>_step-NN[_label].png
+    Returns the absolute path as a string (safe for JSON serialization).
+    """
+    test_dir = Path(SCREENSHOT_DIR) / test_id
+    test_dir.mkdir(parents=True, exist_ok=True)
+
+    clean = _normalize_label(test_id, label)
+    suffix = f"_{clean}" if clean else ""
+    filename = f"{test_id}_step-{step_number:02d}{suffix}.png"
+    filepath = test_dir / filename
+
+    page.screenshot(path=str(filepath), full_page=False)
+    return str(filepath)
 
 
 ================================================
@@ -630,20 +838,129 @@ def parse_step(raw_step: str) -> dict:
 FILE: automation/waits.py
 ================================================
 from playwright.sync_api import Page
-from config import DEFAULT_TIMEOUT
 
-def wait_for_visible(page: Page, test_id: str, timeout: int = DEFAULT_TIMEOUT):
-    """Waits for an element with the given test_id to be visible."""
-    page.get_by_test_id(test_id).wait_for(state="visible", timeout=timeout)
+from config import (
+    DEFAULT_TIMEOUT,
+    SHORT_TIMEOUT,
+    POST_ACTION_SETTLE_MS,
+    NETWORK_IDLE_TIMEOUT_MS,
+    ANIMATION_SETTLE_TIMEOUT_MS,
+)
 
-def wait_for_hidden(page: Page, test_id: str, timeout: int = DEFAULT_TIMEOUT):
-    """Waits for an element with the given test_id to be hidden."""
-    page.get_by_test_id(test_id).wait_for(state="hidden", timeout=timeout)
 
-def wait_for_page_ready(page: Page):
-    """Waits for the page to reach network idle state."""
-    page.wait_for_load_state("networkidle")
+# ---------------------------------------------------------------------------
+# Element-level waits (deterministic, tied to real app state)
+# ---------------------------------------------------------------------------
+def wait_for_visible(page: Page, test_id: str, timeout: int = DEFAULT_TIMEOUT) -> None:
+    page.get_by_test_id(test_id).first.wait_for(state="visible", timeout=timeout)
 
+
+def wait_for_hidden(page: Page, test_id: str, timeout: int = DEFAULT_TIMEOUT) -> None:
+    page.get_by_test_id(test_id).first.wait_for(state="hidden", timeout=timeout)
+
+
+def wait_for_attached(page: Page, test_id: str, timeout: int = DEFAULT_TIMEOUT) -> None:
+    page.get_by_test_id(test_id).first.wait_for(state="attached", timeout=timeout)
+
+
+def wait_for_url_contains(page: Page, fragment: str, timeout: int = DEFAULT_TIMEOUT) -> None:
+    page.wait_for_url(f"**{fragment}**", timeout=timeout)
+
+
+# ---------------------------------------------------------------------------
+# Page-level waits (bounded, best-effort)
+# ---------------------------------------------------------------------------
+def wait_for_document_ready(page: Page, timeout: int = DEFAULT_TIMEOUT) -> None:
+    """React has hydrated and DOM is fully parsed."""
+    try:
+        page.wait_for_function(
+            "() => document.readyState === 'complete'",
+            timeout=timeout,
+        )
+    except Exception:
+        pass
+
+
+def wait_for_network_settled(
+    page: Page,
+    timeout: int = NETWORK_IDLE_TIMEOUT_MS,
+    idle_ms: int = POST_ACTION_SETTLE_MS,
+) -> None:
+    """
+    Bounded 'network quiet' wait. Used sparingly - NOT after every action.
+    Never blocks longer than `timeout`.
+    """
+    try:
+        page.wait_for_load_state("networkidle", timeout=timeout)
+    except Exception:
+        pass
+    # tiny React flush buffer after network goes quiet
+    page.wait_for_timeout(idle_ms)
+
+
+def wait_for_animations(page: Page, timeout: int = ANIMATION_SETTLE_TIMEOUT_MS) -> None:
+    """Wait until all CSS/JS animations have stopped running."""
+    try:
+        page.wait_for_function(
+            "() => document.getAnimations().filter(a => a.playState === 'running').length === 0",
+            timeout=timeout,
+        )
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Composite settle used after every step (Bug #1)
+# ---------------------------------------------------------------------------
+def wait_after_step(page: Page, parsed: dict, next_parsed: dict | None = None) -> None:
+    """
+    Synchronisation strategy:
+
+        ACTION  ->  WAIT FOR RELEVANT APPLICATION STATE  ->  SCREENSHOT
+
+    Look-ahead trick: if the *next* step is an explicit `WAIT_FOR: X`
+    (this is how the Excel test data already encodes "what should appear"),
+    we proactively wait for X here so that the CURRENT step's screenshot
+    is not taken mid-load.
+    """
+    command = (parsed or {}).get("command")
+
+    # --- Look-ahead: honour the next step's WAIT_FOR as our settle signal ---
+    if next_parsed and next_parsed.get("command") == "WAIT_FOR":
+        target = next_parsed.get("target")
+        if target:
+            try:
+                page.get_by_test_id(target).first.wait_for(
+                    state="visible", timeout=DEFAULT_TIMEOUT
+                )
+            except Exception:
+                # Don't fail the current step - the WAIT_FOR step itself
+                # will produce the correct failure if the element never shows.
+                pass
+
+    # --- Command-specific settling -----------------------------------------
+    if command == "OPEN":
+        wait_for_document_ready(page)
+        wait_for_network_settled(page)
+        wait_for_animations(page)
+
+    elif command == "CLICK":
+        # Click may trigger a route change OR just a local React state update.
+        # Bounded network wait covers both, then let animations finish.
+        wait_for_network_settled(page, timeout=SHORT_TIMEOUT)
+        wait_for_animations(page)
+
+    elif command in ("FILL", "CLEAR", "SELECT"):
+        # Controlled inputs re-render synchronously; short settle is enough.
+        page.wait_for_timeout(POST_ACTION_SETTLE_MS)
+
+    elif command in ("ASSERT_VISIBLE", "ASSERT_TEXT", "WAIT_FOR"):
+        # Element wait already happened inside the command itself.
+        wait_for_animations(page, timeout=1_000)
+
+    else:
+        # SCREENSHOT or unknown -> just make sure animations are quiet.
+        wait_for_animations(page, timeout=1_000)
 
 
 ================================================

@@ -6,6 +6,7 @@ from config import (
     POST_ACTION_SETTLE_MS,
     NETWORK_IDLE_TIMEOUT_MS,
     ANIMATION_SETTLE_TIMEOUT_MS,
+    REACT_CYCLE_TIMEOUT_MS,
 )
 
 
@@ -42,6 +43,24 @@ def wait_for_document_ready(page: Page, timeout: int = DEFAULT_TIMEOUT) -> None:
         pass
 
 
+def wait_for_react_cycle(page: Page, timeout: int = REACT_CYCLE_TIMEOUT_MS) -> None:
+    """
+    Wait for React to finish its current render cycle.
+
+    Uses double requestAnimationFrame: React's scheduler flushes state
+    updates on microtasks, then the browser paints on the next RAF. Two
+    RAFs guarantee: state commit -> DOM mutation -> paint.
+    Cheap (<20ms in practice), bounded, and never throws.
+    """
+    try:
+        page.wait_for_function(
+            "() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))",
+            timeout=timeout,
+        )
+    except Exception:
+        pass
+
+
 def wait_for_network_settled(
     page: Page,
     timeout: int = NETWORK_IDLE_TIMEOUT_MS,
@@ -55,7 +74,6 @@ def wait_for_network_settled(
         page.wait_for_load_state("networkidle", timeout=timeout)
     except Exception:
         pass
-    # tiny React flush buffer after network goes quiet
     page.wait_for_timeout(idle_ms)
 
 
@@ -106,9 +124,10 @@ def wait_after_step(page: Page, parsed: dict, next_parsed: dict | None = None) -
         wait_for_animations(page)
 
     elif command == "CLICK":
-        # Click may trigger a route change OR just a local React state update.
-        # Bounded network wait covers both, then let animations finish.
+        # Click may trigger a route change, a submit-button validation render,
+        # OR just a local React state update. We cover all three:
         wait_for_network_settled(page, timeout=SHORT_TIMEOUT)
+        wait_for_react_cycle(page)          # catches form-submit validation
         wait_for_animations(page)
 
     elif command in ("FILL", "CLEAR", "SELECT"):

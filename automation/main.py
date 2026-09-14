@@ -10,6 +10,7 @@ from config import (
     SCREENSHOT_DIR,
 )
 from excel_reader import load_test_cases
+from excel_writer import write_results
 from step_parser import parse_step
 from executor import execute_step, settle_after_step
 from screenshot_manager import capture_screenshot
@@ -29,6 +30,32 @@ def _human_step_label(parsed: dict, raw: str) -> str:
     if tgt:
         return f"{cmd}: {tgt}"
     return raw.strip()
+
+
+def _compute_scroll_target(parsed: dict, next_parsed: dict | None) -> str | None:
+    """
+    Decide which element to focus before the screenshot.
+
+    Priority:
+      1. What the *next* step is waiting for (that's the freshly rendered
+         content produced by the current action). This is what makes the
+         validation-error screenshot land on the right element.
+      2. Otherwise, this step's own target.
+      3. Otherwise, no scroll (OPEN -> top of page; SCREENSHOT -> leave the
+         viewport where the previous step put it).
+    """
+    cmd = parsed.get("command")
+    if cmd == "OPEN":
+        return None
+
+    if next_parsed and next_parsed.get("command") == "WAIT_FOR":
+        return next_parsed.get("target")
+
+    if cmd in ("FILL", "CLICK", "WAIT_FOR", "ASSERT_VISIBLE",
+               "ASSERT_TEXT", "SELECT", "CLEAR"):
+        return parsed.get("target")
+
+    return None  # SCREENSHOT or unknown
 
 
 def _briefly_settle_for_failure(page) -> None:
@@ -80,12 +107,16 @@ def run_one_test(browser, test_case) -> TestExecutionResult:
             # 2. Wait for the app to reach a relevant, stable state (Bug #1 fix)
             settle_after_step(page, parsed, next_parsed)
 
-            # 3. Screenshot after EVERY step
+            # 3. Screenshot after EVERY step. Scroll the focus element
+            #    into the viewport first, otherwise top-of-form errors are
+            #    invisible when Playwright auto-scrolled to the submit button.
             label = ""
             if parsed.get("command") == "SCREENSHOT" and parsed.get("target"):
                 label = parsed["target"]
+
+            scroll_target = _compute_scroll_target(parsed, next_parsed)
             sr.screenshot_path = capture_screenshot(
-                page, test_case.test_id, idx, label
+                page, test_case.test_id, idx, label, scroll_target=scroll_target
             )
 
             sr.status = "PASS"
@@ -95,15 +126,15 @@ def run_one_test(browser, test_case) -> TestExecutionResult:
             sr.status = "FAIL"
             sr.error_message = str(e)
             test_status = "FAIL"
-            failure_reason = (
-                f"Step {idx} ({parsed.get('command')}): {e}"
-            )
+            failure_reason = f"Step {idx} ({parsed.get('command')}): {e}"
 
-            # Failure screenshot
+            # Failure screenshot - still try to scroll to the failure target
             _briefly_settle_for_failure(page)
             try:
+                fail_scroll = parsed.get("target")
                 sr.screenshot_path = capture_screenshot(
-                    page, test_case.test_id, idx, "FAILED"
+                    page, test_case.test_id, idx, "FAILED",
+                    scroll_target=fail_scroll,
                 )
             except Exception:
                 pass
@@ -117,8 +148,6 @@ def run_one_test(browser, test_case) -> TestExecutionResult:
             sr.duration_ms = int((time.perf_counter() - step_start) * 1000)
             step_results.append(sr)
 
-        # Stop executing further steps of this test on failure, but
-        # DO NOT abort the whole run - the caller moves to the next test.
         if sr.status == "FAIL":
             break
 
@@ -150,7 +179,7 @@ def run_one_test(browser, test_case) -> TestExecutionResult:
 # ---------------------------------------------------------------------------
 def run_tests() -> list[TestExecutionResult]:
     print("=" * 60)
-    print("AI HOTEL TEST AUTOMATION - PART 3 (Stage 1)")
+    print("AI HOTEL TEST AUTOMATION - PART 3 (Stage 1.1)")
     print("=" * 60)
     print(f"Excel:     {EXCEL_FILE}")
     print(f"Base URL:  {BASE_URL}")
@@ -202,7 +231,11 @@ def run_tests() -> list[TestExecutionResult]:
 
         browser.close()
 
-    # ----- Summary ----------------------------------------------------------
+    # ----- Excel write-back ------------------------------------------------
+    print("-" * 60)
+    write_results(results)
+
+    # ----- Summary ---------------------------------------------------------
     print("=" * 60)
     print("EXECUTION SUMMARY")
     print("=" * 60)

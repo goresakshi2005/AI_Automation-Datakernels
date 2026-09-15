@@ -4,6 +4,7 @@ Directory structure:
     │   ├── ai_verifier.py
     │   ├── config.py
     │   ├── excel_reader.py
+    │   ├── excel_writer.py
     │   ├── executor.py
     │   ├── generate_test_cases.py
     │   ├── main.py
@@ -11,6 +12,7 @@ Directory structure:
     │   ├── requirements.txt
     │   ├── screenshot_manager.py
     │   ├── step_parser.py
+    │   ├── test_gemini.py
     │   └── waits.py
     ├── Hotel_Booking/
     │   ├── README.md
@@ -43,42 +45,567 @@ Directory structure:
     │           ├── formatDate.js
     │           └── validation.js
     └── test_cases/
-        └── sample_test_cases.xlsx
+        ├── sample_test_cases.xlsx
+        ├── test_results.xlsx
+        └── ~$test_results.xlsx
 
 ================================================
 FILE: automation/ai_verifier.py
 ================================================
 """
-Placeholder interface for AI Vision verification (Part 3 Stage 2).
+Part 4 â€” AI Vision verification using Google Gemini.
 
-Do NOT call any real AI here yet. This file only defines the shape of the
-future integration so that Stage 2 can plug in without touching main.py.
+Design:
+  * Screenshot is sent as an image to a vision-capable Gemini model.
+  * Strict structured prompt asks for JSON: {status, confidence, observation}.
+  * Few-shot examples + hallucination-protection rules are included.
+  * Response is validated; malformed output becomes UNCERTAIN (never PASS).
+  * API / key / quota errors never crash the test suite â€” they become UNCERTAIN.
+  * Fallback model list is tried in order on 404 (model-not-found).
+  * Rate limiter enforces a minimum gap between calls.
+  * Quota (429) and server (503) errors short-circuit the fallback loop
+    because retrying them across all models wastes the daily budget.
 """
+from __future__ import annotations
+
+import json
+import re
+import time
 from dataclasses import dataclass
+from pathlib import Path
+from threading import Lock
 from typing import Optional
 
+from config import (
+    AI_ENABLED,
+    AI_MODEL,
+    AI_MODEL_FALLBACKS,
+    AI_CONFIDENCE_THRESHOLD,
+    AI_MAX_RETRIES,
+    AI_MIN_SECONDS_BETWEEN_CALLS,
+    GEMINI_API_KEY,
+)
 
+
+# ---------------------------------------------------------------------------
+# Result dataclass
+# ---------------------------------------------------------------------------
 @dataclass
 class AIVerification:
-    status: str = "NOT RUN"            # PASS / FAIL / UNCERTAIN / NOT RUN
-    confidence: Optional[float] = None  # 0.0 - 1.0
+    status: str = "NOT RUN"
+    confidence: Optional[float] = None
     observation: Optional[str] = None
 
 
+# ---------------------------------------------------------------------------
+# Lazy client
+# ---------------------------------------------------------------------------
+_GENAI_CLIENT = None
+
+
+def _get_genai_client():
+    global _GENAI_CLIENT
+    if _GENAI_CLIENT is not None:
+        return _GENAI_CLIENT
+    if not AI_ENABLED or not GEMINI_API_KEY:
+        return None
+    try:
+        from google import genai  # type: ignore
+        _GENAI_CLIENT = genai.Client(api_key=GEMINI_API_KEY)
+        return _GENAI_CLIENT
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Rate limiter (simple, process-wide)
+# ---------------------------------------------------------------------------
+_rate_lock = Lock()
+_last_call_ts = 0.0
+
+
+def _enforce_rate_limit() -> None:
+    """Sleep just enough so two calls never fire closer than the configured gap."""
+    global _last_call_ts
+    if AI_MIN_SECONDS_BETWEEN_CALLS <= 0:
+        return
+    with _rate_lock:
+        now = time.monotonic()
+        wait = AI_MIN_SECONDS_BETWEEN_CALLS - (now - _last_call_ts)
+        if wait > 0:
+            time.sleep(wait)
+        _last_call_ts = time.monotonic()
+
+
+# ---------------------------------------------------------------------------
+# System instruction
+# ---------------------------------------------------------------------------
+SYSTEM_INSTRUCTION = """You are a UI test verification system.
+
+Your job is to compare the attached screenshot with the expected visual state.
+
+You must only judge what is visibly supported by the screenshot.
+
+Never invent hidden UI state.
+Never assume backend behavior.
+Never assume an element exists if it is not visible.
+Do not infer functionality that cannot be visually verified.
+Never mark PASS based only on the test description.
+Never mark FAIL because the UI looks different from your personal design preference.
+Do not comment on colors, spacing, fonts, or aesthetics unless they hide required content.
+
+Return ONLY valid JSON matching the requested schema.
+"""
+
+
+FEW_SHOT_EXAMPLES = """
+EXAMPLE 1 â€” PASS
+Expected visual state: "The booking confirmation container should be clearly visible."
+Situation: The screenshot clearly shows the booking confirmation heading, content, and booking reference.
+Output:
+{"status":"PASS","confidence":0.98,"observation":"The booking confirmation is clearly visible with a booking reference."}
+
+EXAMPLE 2 â€” FAIL
+Expected visual state: "The booking confirmation container should be clearly visible."
+Situation: The screenshot shows the payment form with a validation error, and no confirmation.
+Output:
+{"status":"FAIL","confidence":0.96,"observation":"The booking confirmation is absent; the payment form is still displayed."}
+
+EXAMPLE 3 â€” UNCERTAIN
+Expected visual state: "The email validation error should be visible below the email field."
+Situation: The screenshot is cropped and the email field/error area is not visible.
+Output:
+{"status":"UNCERTAIN","confidence":0.92,"observation":"The email validation area is outside the visible screenshot."}
+"""
+
+
+def _build_user_prompt(
+    test_id: str,
+    test_name: str,
+    category: str,
+    step_number: int,
+    step_command: str,
+    step_target: Optional[str],
+    step_value: Optional[str],
+    expected_result: str,
+    step_expectation: str,
+) -> str:
+    header = (
+        f"Test ID: {test_id}\n"
+        f"Test Name: {test_name}\n"
+        f"Category: {category}\n"
+        f"Step Number: {step_number}\n"
+        f"Current Step: {step_command}\n"
+        f"Step Target: {step_target or '(none)'}\n"
+        f"Step Value: {step_value or '(none)'}\n"
+        f"\n"
+        f"Expected Visual State (for THIS step only):\n"
+        f"{step_expectation}\n"
+        f"\n"
+        f"Overall Test Expected Result (for context, NOT for this step):\n"
+        f"{expected_result}\n"
+    )
+
+    footer = """
+Analyze the attached screenshot.
+
+Return ONLY this JSON structure:
+{
+  "status": "PASS",
+  "confidence": 0.97,
+  "observation": "Short factual observation under 200 characters."
+}
+
+Rules:
+1. status must be exactly one of: PASS, FAIL, UNCERTAIN.
+2. confidence must be a number between 0.0 and 1.0.
+3. PASS means the expected visual state is clearly visible in THIS screenshot.
+4. FAIL means the screenshot clearly contradicts or does not satisfy the expected visual state.
+5. UNCERTAIN means there is insufficient visual evidence.
+6. Never invent elements, text, errors, buttons, pages, or states that are not visible.
+7. Never assume a backend/database operation succeeded.
+8. Never assume an element is visible if it is cropped or hidden.
+9. If the screenshot is too blurry, cropped, blank, or otherwise insufficient, return UNCERTAIN.
+10. Keep observation under 200 characters.
+11. Return JSON only. Do not wrap JSON in Markdown code fences.
+"""
+
+    return header + "\n" + FEW_SHOT_EXAMPLES + "\n" + footer
+
+
+# ---------------------------------------------------------------------------
+# Response parsing
+# ---------------------------------------------------------------------------
+_JSON_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
+
+
+def _strip_markdown_fences(text: str) -> str:
+    text = text.strip()
+    if text.startswith("```"):
+        text = _JSON_FENCE_RE.sub("", text).strip()
+    return text
+
+
+def parse_ai_response(raw_text: str) -> AIVerification:
+    if not raw_text or not raw_text.strip():
+        return AIVerification("UNCERTAIN", None, "AI returned empty output.")
+
+    cleaned = _strip_markdown_fences(raw_text)
+    try:
+        data = json.loads(cleaned)
+    except Exception:
+        return AIVerification("UNCERTAIN", None, "AI returned invalid structured output.")
+
+    if not isinstance(data, dict):
+        return AIVerification("UNCERTAIN", None, "AI returned non-object JSON.")
+
+    status = str(data.get("status", "")).strip().upper()
+    if status not in ("PASS", "FAIL", "UNCERTAIN"):
+        return AIVerification("UNCERTAIN", None, f"Unexpected status: {status!r}")
+
+    try:
+        confidence = float(data.get("confidence"))
+    except (TypeError, ValueError):
+        return AIVerification("UNCERTAIN", None, "Invalid confidence value.")
+
+    if not (0.0 <= confidence <= 1.0):
+        return AIVerification("UNCERTAIN", None, "Confidence out of range.")
+
+    observation = str(data.get("observation", "")).strip()
+    if len(observation) > 200:
+        observation = observation[:197] + "..."
+
+    return AIVerification(status, confidence, observation or None)
+
+
+# ---------------------------------------------------------------------------
+# Step-level visual expectation
+# ---------------------------------------------------------------------------
+def get_step_visual_expectation(
+    test_id: str,
+    test_name: str,
+    category: str,
+    command: str,
+    target: Optional[str],
+    value: Optional[str],
+    overall_expected_result: str,
+) -> str:
+    cmd = (command or "").upper()
+    tgt = (target or "").strip()
+    val = (value or "").strip()
+    cat = (category or "").lower()
+    is_validation = "validation" in cat or "-error" in tgt.lower()
+
+    if cmd == "WAIT_FOR" and tgt.endswith("-error"):
+        return (
+            f"A validation error message must be visibly displayed below the "
+            f"{tgt.replace('-error', '').replace('-', ' ')} field."
+        )
+    if cmd == "ASSERT_VISIBLE" and tgt.endswith("-error"):
+        return f"The validation error message ({tgt}) must be clearly visible."
+
+    if cmd == "OPEN":
+        if tgt in ("/", ""):
+            return "The hotel booking home page with the search form should be visible."
+        if tgt == "/bookings":
+            return "The 'My Bookings' page should be visible."
+        return f"The page at {tgt} should be loaded and visible."
+
+    if cmd == "FILL":
+        field = tgt.replace("-", " ")
+        if val:
+            return (
+                f"The form should remain visible and the '{field}' field "
+                f"should contain '{val}'."
+            )
+        return f"The form should remain visible and the '{field}' field should be empty."
+
+    if cmd == "CLICK":
+        if tgt == "search-button":
+            return "The application should navigate to the search results page showing available room cards."
+        if tgt == "view-details-1":
+            return "The room details page should be visible with the room name, type, and price."
+        if tgt == "book-now-button":
+            return "The booking form should be visible with the guest information section."
+        if tgt == "confirm-booking-button":
+            if is_validation:
+                return "The form should remain visible with a validation error message displayed."
+            return "The booking confirmation page should be visible."
+        return f"After clicking {tgt}, the expected result should be visible."
+
+    if cmd == "WAIT_FOR":
+        if tgt.startswith("room-card"):
+            return "Search results should display available room cards."
+        if tgt == "room-name":
+            return "The room details page should be visible with the room name."
+        if tgt == "first-name-input":
+            return "The booking form should be visible with guest information fields."
+        if tgt == "booking-confirmation":
+            return "The booking confirmation page should be visible."
+        if tgt.startswith("booking-card"):
+            return "The 'My Bookings' page should list at least one booking card."
+        return f"The element '{tgt}' should be visibly present."
+
+    if cmd == "ASSERT_VISIBLE":
+        if tgt == "booking-confirmation":
+            return "The booking confirmation container should be clearly visible."
+        if tgt.startswith("room-card"):
+            return "The room card should be clearly visible in the search results."
+        if tgt == "room-name":
+            return "The room name heading should be clearly visible."
+        if tgt.startswith("booking-card"):
+            return "At least one booking card should be clearly visible."
+        return f"The element '{tgt}' should be clearly visible."
+
+    if cmd == "ASSERT_TEXT":
+        return f"The element '{tgt}' should visibly contain the text '{val}'."
+
+    if cmd == "SCREENSHOT":
+        if tgt and "validation" in tgt.lower():
+            return "A validation error message should be clearly visible."
+        return overall_expected_result or "The expected final state should be visible."
+
+    if cmd in ("SELECT", "CLEAR"):
+        return f"The form should remain visible and the '{tgt}' field should reflect the change."
+
+    return f"The UI should reflect the effect of: {command} {tgt or ''}".strip()
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def _read_image_bytes(screenshot_path: str) -> Optional[bytes]:
+    p = Path(screenshot_path)
+    if not p.exists():
+        return None
+    try:
+        return p.read_bytes()
+    except Exception:
+        return None
+
+
+def _safe_error(exc: Exception) -> str:
+    msg = str(exc)
+    if GEMINI_API_KEY:
+        msg = msg.replace(GEMINI_API_KEY, "***REDACTED***")
+    msg = " ".join(msg.split())
+    if len(msg) > 240:
+        msg = msg[:237] + "..."
+    return f"{type(exc).__name__}: {msg}" if msg else type(exc).__name__
+
+
+def _error_code(exc: Exception) -> int:
+    """Best-effort extraction of the HTTP-ish code from a google-genai error."""
+    text = str(exc)
+    for code in (429, 503, 500, 404, 403, 401):
+        if f"{code}" in text[:200] or f"code': {code}" in text:
+            return code
+    if "RESOURCE_EXHAUSTED" in text:
+        return 429
+    if "UNAVAILABLE" in text:
+        return 503
+    if "NOT_FOUND" in text:
+        return 404
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Single model call
+# ---------------------------------------------------------------------------
+def _call_model_once(client, model_name: str, image_bytes: bytes, user_prompt: str) -> str:
+    from google.genai import types  # type: ignore
+
+    config = types.GenerateContentConfig(
+        system_instruction=SYSTEM_INSTRUCTION,
+        temperature=0.0,
+        response_mime_type="application/json",
+    )
+
+    response = client.models.generate_content(
+        model=model_name,
+        contents=[
+            types.Part.from_bytes(data=image_bytes, mime_type="image/png"),
+            user_prompt,
+        ],
+        config=config,
+    )
+
+    text = getattr(response, "text", None)
+    if not text and getattr(response, "candidates", None):
+        try:
+            parts = response.candidates[0].content.parts
+            text = "".join(getattr(p, "text", "") or "" for p in parts)
+        except Exception:
+            text = None
+    return text or ""
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 def verify_step(
     screenshot_path: str,
-    step_command: str,
-    expected_result: str,
+    test_id: str = "",
+    test_name: str = "",
+    category: str = "",
+    step_number: int = 0,
+    step_command: str = "",
+    step_target: Optional[str] = None,
+    step_value: Optional[str] = None,
+    expected_result: str = "",
+    step_expectation: str = "",
 ) -> AIVerification:
-    """
-    Stage 2 will replace this body with a structured-prompt call to a Vision API.
-    For now: explicitly signal that verification has not run.
-    """
-    return AIVerification(
-        status="NOT RUN",
-        confidence=None,
-        observation="AI verification not implemented yet (Part 3 Stage 2).",
+    if not AI_ENABLED:
+        return AIVerification("NOT RUN", None, "AI verification is disabled (AI_ENABLED=False).")
+
+    if not GEMINI_API_KEY:
+        return AIVerification(
+            "UNCERTAIN", None,
+            "AI verification unavailable: GEMINI_API_KEY / GOOGLE_API_KEY is not configured.",
+        )
+
+    image_bytes = _read_image_bytes(screenshot_path)
+    if image_bytes is None:
+        return AIVerification("UNCERTAIN", None, "Screenshot file is missing or unreadable.")
+
+    client = _get_genai_client()
+    if client is None:
+        return AIVerification(
+            "UNCERTAIN", None,
+            "AI verification unavailable: google-genai SDK not installed or client failed.",
+        )
+
+    if not step_expectation:
+        step_expectation = get_step_visual_expectation(
+            test_id, test_name, category,
+            step_command, step_target, step_value, expected_result,
+        )
+
+    user_prompt = _build_user_prompt(
+        test_id, test_name, category, step_number,
+        step_command, step_target, step_value,
+        expected_result, step_expectation,
     )
+
+    models_to_try: list[str] = []
+    for m in [AI_MODEL] + list(AI_MODEL_FALLBACKS):
+        if m and m not in models_to_try:
+            models_to_try.append(m)
+
+    last_error = "unknown error"
+    last_code = 0
+
+    for model_name in models_to_try:
+        for attempt in range(AI_MAX_RETRIES + 1):
+            try:
+                _enforce_rate_limit()
+                raw_text = _call_model_once(client, model_name, image_bytes, user_prompt)
+                parsed = parse_ai_response(raw_text)
+
+                if parsed.status != "UNCERTAIN":
+                    return parsed
+
+                if attempt < AI_MAX_RETRIES:
+                    continue
+                last_error = f"model {model_name}: {parsed.observation}"
+                break
+
+            except Exception as e:
+                code = _error_code(e)
+                last_code = code
+                last_error = f"model {model_name}: {_safe_error(e)}"
+
+                # 429 / 503 -> quota or server-side issue; trying other models
+                # will just burn the daily budget. Stop immediately.
+                if code in (429, 503):
+                    if code == 429:
+                        return AIVerification(
+                            "UNCERTAIN", None,
+                            "AI quota exhausted (429). Reduce AI_VERIFY_EVERY_SCREENSHOT "
+                            "or wait for quota reset. " + last_error,
+                        )
+                    return AIVerification(
+                        "UNCERTAIN", None,
+                        "AI service temporarily unavailable (503). " + last_error,
+                    )
+
+                # 404 -> wrong model name; try next fallback.
+                # Anything else -> try next fallback too.
+                break
+
+    return AIVerification(
+        "UNCERTAIN", None,
+        f"AI verification unavailable. {last_error}",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Aggregation
+# ---------------------------------------------------------------------------
+def aggregate_final_status(
+    deterministic_status: str,
+    step_results,
+    confidence_threshold: float = AI_CONFIDENCE_THRESHOLD,
+):
+    if deterministic_status != "PASS":
+        return ("FAIL", "FAIL", "Deterministic Playwright checks failed.")
+
+    if not AI_ENABLED:
+        return ("PASS", "NOT RUN", "AI verification disabled.")
+
+    counts = {"PASS": 0, "FAIL": 0, "UNCERTAIN": 0, "NOT RUN": 0}
+    high_conf_fails = []
+
+    for sr in step_results:
+        s = (sr.ai_status or "NOT RUN").upper()
+        if s not in counts:
+            s = "NOT RUN"
+        counts[s] += 1
+        if (
+            s == "FAIL"
+            and sr.ai_confidence is not None
+            and sr.ai_confidence >= confidence_threshold
+        ):
+            high_conf_fails.append(sr)
+
+    if high_conf_fails:
+        final_step_num = max((sr.step_number for sr in step_results), default=0)
+        fails_on_final = [f for f in high_conf_fails if f.step_number == final_step_num]
+
+        # Only let AI override the deterministic result when the failure is
+        # on the final frame OR when at least two independent checkpoints fail.
+        if fails_on_final or len(high_conf_fails) >= 2:
+            worst = max(high_conf_fails, key=lambda x: x.ai_confidence or 0)
+            return (
+                "FAIL", "FAIL",
+                f"High-confidence AI visual mismatch at step {worst.step_number} "
+                f"({int((worst.ai_confidence or 0) * 100)}%): {worst.ai_observation or ''}".strip(),
+        )
+        # Otherwise: record the uncertainty but don't fail the run.
+        return (
+            "PASS", "UNCERTAIN",
+            f"Deterministic checks passed. {len(high_conf_fails)} isolated AI FAIL(s) below the 2-hit threshold.",
+        )
+
+    if counts["FAIL"] > 0:
+        return (
+            "PASS", "UNCERTAIN",
+            f"Deterministic checks passed. {counts['FAIL']} low-confidence AI FAIL(s) ignored.",
+        )
+
+    if counts["UNCERTAIN"] > 0:
+        return (
+            "PASS", "UNCERTAIN",
+            f"Deterministic checks passed; AI was UNCERTAIN on {counts['UNCERTAIN']} checkpoint(s).",
+        )
+
+    if counts["PASS"] > 0:
+        return (
+            "PASS", "PASS",
+            f"All {counts['PASS']} AI visual checkpoint(s) passed.",
+        )
+
+    return ("PASS", "NOT RUN", "No AI checkpoints evaluated.")
 
 
 ================================================
@@ -86,6 +613,7 @@ FILE: automation/config.py
 ================================================
 from pathlib import Path
 from datetime import datetime
+import os
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -98,20 +626,28 @@ BASE_URL = "http://localhost:5173"
 # ---------------------------------------------------------------------------
 # Browser / timeouts
 # ---------------------------------------------------------------------------
-HEADLESS = False                       # set True for CI
-DEFAULT_TIMEOUT = 10_000               # ms - for elements we *know* must appear
-SHORT_TIMEOUT = 3_000                  # ms - for opportunistic / best-effort waits
+HEADLESS = False
+DEFAULT_TIMEOUT = 10_000
+SHORT_TIMEOUT = 3_000
 MAX_RETRIES = 1
 
 # ---------------------------------------------------------------------------
 # Wait tuning (Bug #1)
 # ---------------------------------------------------------------------------
-POST_ACTION_SETTLE_MS = 120            # tiny React re-render buffer after FILL
-NETWORK_IDLE_TIMEOUT_MS = 3_000        # bounded wait for background network
-ANIMATION_SETTLE_TIMEOUT_MS = 2_000    # bounded wait for CSS animations to end
+POST_ACTION_SETTLE_MS = 120
+NETWORK_IDLE_TIMEOUT_MS = 3_000
+ANIMATION_SETTLE_TIMEOUT_MS = 2_000
+REACT_CYCLE_TIMEOUT_MS = 800
 
 # ---------------------------------------------------------------------------
-# Per-run screenshot root - prevents overwriting previous runs
+# Screenshot behaviour (Bug #1)
+# ---------------------------------------------------------------------------
+SCROLL_BEFORE_SCREENSHOT = True
+SCROLL_TIMEOUT_MS = 2_000
+SCROLL_SETTLE_MS = 80
+
+# ---------------------------------------------------------------------------
+# Per-run screenshot root
 # ---------------------------------------------------------------------------
 RUN_ID = datetime.now().strftime("%Y%m%d_%H%M%S")
 SCREENSHOT_DIR = PROJECT_ROOT / "screenshots" / f"run_{RUN_ID}"
@@ -121,6 +657,46 @@ SCREENSHOT_DIR = PROJECT_ROOT / "screenshots" / f"run_{RUN_ID}"
 # ---------------------------------------------------------------------------
 TEST_CASES_DIR = PROJECT_ROOT / "test_cases"
 EXCEL_FILE = TEST_CASES_DIR / "sample_test_cases.xlsx"
+RESULTS_FILE = TEST_CASES_DIR / "test_results.xlsx"
+WRITE_BACK_TO_SOURCE = True
+
+# ---------------------------------------------------------------------------
+# PART 4 â€” AI Vision Verification (Gemini)
+# ---------------------------------------------------------------------------
+AI_ENABLED = True
+
+# Primary model â€” confirmed working on this API key by test_gemini.py.
+AI_MODEL = os.getenv("AI_MODEL", "gemini-2.5-flash")
+
+# Fallbacks â€” only models currently live on the v1beta API.
+# (gemini-1.5-*, gemini-2.0-flash, gemini-2.5-flash-lite, gemini-2.5-pro
+#  are deprecated for new users and return 404.)
+AI_MODEL_FALLBACKS = [
+    "gemini-3-flash-preview",
+    "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
+]
+
+AI_CONFIDENCE_THRESHOLD = 0.80
+AI_MAX_RETRIES = 1
+AI_REQUEST_TIMEOUT_MS = 30_000
+
+# ---------------------------------------------------------------------------
+# Cost / quota controls
+# ---------------------------------------------------------------------------
+# True:  verify every screenshot (assignment-max setting, high quota cost).
+# False: verify only meaningful checkpoints â€” recommended for free tier.
+AI_VERIFY_EVERY_SCREENSHOT = False
+
+# Hard cap on AI calls per run (0 = unlimited).
+AI_MAX_CALLS_PER_RUN = 80   # unchanged â€” but now you'll use ~45
+
+# Minimum seconds between consecutive AI calls (rate-limit guard).
+# 4s â‰ˆ 15 RPM ceiling.
+AI_MIN_SECONDS_BETWEEN_CALLS = 4.0
+
+# Reads GEMINI_API_KEY first, falls back to GOOGLE_API_KEY.
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 
 
 ================================================
@@ -195,6 +771,154 @@ def load_test_cases() -> list[TestCase]:
         raise ValueError("No test cases were found in the Excel file.")
 
     return test_cases
+
+
+================================================
+FILE: automation/excel_writer.py
+================================================
+"""
+Writes test execution results back into the Excel workbook.
+
+Two things happen:
+  1. `test_results.xlsx` is always created as a copy of the source with
+     Status + AI Observation populated.
+  2. The original `sample_test_cases.xlsx` is updated *in place* unless
+     it's locked (open in Excel) - in which case we warn and continue.
+"""
+from pathlib import Path
+
+from openpyxl import load_workbook
+
+from config import EXCEL_FILE, RESULTS_FILE, WRITE_BACK_TO_SOURCE
+
+
+def _load_source():
+    src = Path(EXCEL_FILE)
+    if not src.exists():
+        raise FileNotFoundError(f"Source workbook not found: {src}")
+    return load_workbook(src)
+
+
+def _format_ai_observation(result) -> str:
+    """Build a concise AI Observation string for Excel."""
+    ai_status = (result.ai_status or "NOT RUN").upper()
+    counts = (
+        f"PASS:{result.ai_pass_count} "
+        f"FAIL:{result.ai_fail_count} "
+        f"UNCERTAIN:{result.ai_uncertain_count}"
+    )
+
+    # Try to surface the most informative per-step observation.
+    best_obs = None
+    for sr in result.step_results:
+        if sr.ai_status == "FAIL" and sr.ai_observation:
+            best_obs = sr.ai_observation
+            break
+    if best_obs is None:
+        for sr in result.step_results:
+            if sr.ai_status == "UNCERTAIN" and sr.ai_observation:
+                best_obs = sr.ai_observation
+                break
+    if best_obs is None:
+        for sr in result.step_results:
+            if sr.ai_status == "PASS" and sr.ai_observation:
+                best_obs = sr.ai_observation
+                break
+
+    if result.ai_observation:
+        summary = result.ai_observation
+    else:
+        summary = "No AI summary available."
+
+    return f"[{ai_status}] ({counts}) {summary}"[:500]
+
+
+def _update_sheet(ws, results) -> int:
+    headers = [c.value for c in ws[1]]
+    required = ["Test ID", "Status", "AI Observation"]
+    missing = [h for h in required if h not in headers]
+    if missing:
+        raise ValueError(
+            f"Workbook is missing required column(s) {missing}. "
+            f"Found: {headers}"
+        )
+
+    col_id = headers.index("Test ID") + 1
+    col_status = headers.index("Status") + 1
+    col_ai = headers.index("AI Observation") + 1
+
+    result_map = {r.test_id: r for r in results}
+    updated = 0
+
+    for row in range(2, ws.max_row + 1):
+        raw_id = ws.cell(row=row, column=col_id).value
+        if raw_id is None:
+            continue
+        tid = str(raw_id).strip()
+        if not tid:
+            continue
+        res = result_map.get(tid)
+        if res is None:
+            continue
+
+        ws.cell(row=row, column=col_status).value = res.status
+        ws.cell(row=row, column=col_ai).value = _format_ai_observation(res)
+        updated += 1
+
+    return updated
+
+
+def write_results(results) -> None:
+    """Populate Status + AI Observation from `results` and save."""
+    if not results:
+        print("[excel_writer] No results to write.")
+        return
+
+    try:
+        wb = _load_source()
+    except Exception as e:
+        print(f"[excel_writer] Cannot open source workbook: {e}")
+        return
+
+    ws = wb.active
+    try:
+        updated = _update_sheet(ws, results)
+    except Exception as e:
+        print(f"[excel_writer] Failed to update sheet: {e}")
+        return
+
+    if updated == 0:
+        print("[excel_writer] No matching Test IDs found; nothing written.")
+        return
+
+    # ---- 1. Always write the results copy ---------------------------------
+    try:
+        results_path = Path(RESULTS_FILE)
+        results_path.parent.mkdir(parents=True, exist_ok=True)
+        wb.save(results_path)
+        print(f"[excel_writer] Wrote results copy:  {results_path}")
+    except PermissionError:
+        print(
+            f"[excel_writer] Permission denied writing {RESULTS_FILE}. "
+            f"Close the file in Excel and re-run."
+        )
+    except Exception as e:
+        print(f"[excel_writer] Failed to write {RESULTS_FILE}: {e}")
+
+    # ---- 2. Best-effort update of the source file -------------------------
+    if WRITE_BACK_TO_SOURCE and Path(EXCEL_FILE).resolve() != Path(RESULTS_FILE).resolve():
+        try:
+            wb.save(EXCEL_FILE)
+            print(f"[excel_writer] Updated source file: {EXCEL_FILE}")
+        except PermissionError:
+            print(
+                f"[excel_writer] Could not update {EXCEL_FILE} "
+                f"(likely open in Excel). Results copy is still valid."
+            )
+        except Exception as e:
+            print(f"[excel_writer] Could not update {EXCEL_FILE}: {e}")
+
+    print(f"[excel_writer] Updated {updated} row(s).")
 
 
 ================================================
@@ -467,13 +1191,22 @@ from config import (
     EXCEL_FILE,
     HEADLESS,
     SCREENSHOT_DIR,
+    AI_ENABLED,
+    AI_VERIFY_EVERY_SCREENSHOT,
+    AI_MAX_CALLS_PER_RUN,
 )
 from excel_reader import load_test_cases
+from excel_writer import write_results
 from step_parser import parse_step
 from executor import execute_step, settle_after_step
 from screenshot_manager import capture_screenshot
 from models import StepResult, TestExecutionResult
 from waits import wait_for_animations
+from ai_verifier import (
+    verify_step,
+    get_step_visual_expectation,
+    aggregate_final_status,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -490,6 +1223,27 @@ def _human_step_label(parsed: dict, raw: str) -> str:
     return raw.strip()
 
 
+def _compute_scroll_target(parsed: dict, next_parsed: dict | None) -> str | None:
+    """
+    Decide which element to focus *before* the screenshot for this step.
+
+    Priority:
+      1. What the NEXT step is waiting for (that's the freshly rendered
+         content produced by the CURRENT action).
+      2. Otherwise, this step's own target.
+      3. Otherwise, None (SCREENSHOT and OPEN are handled by the caller).
+    """
+    cmd = parsed.get("command")
+    if cmd == "OPEN":
+        return None
+    if next_parsed and next_parsed.get("command") == "WAIT_FOR":
+        return next_parsed.get("target")
+    if cmd in ("FILL", "CLICK", "WAIT_FOR", "ASSERT_VISIBLE",
+               "ASSERT_TEXT", "SELECT", "CLEAR"):
+        return parsed.get("target")
+    return None
+
+
 def _briefly_settle_for_failure(page) -> None:
     """Give the app a moment to render an error UI before the FAILED screenshot."""
     try:
@@ -499,10 +1253,45 @@ def _briefly_settle_for_failure(page) -> None:
         pass
 
 
+def _should_verify_with_ai(cmd: str, next_parsed: dict | None, is_last_step: bool) -> bool:
+    """
+    Decide whether to send this step's screenshot to AI.
+
+    When AI_VERIFY_EVERY_SCREENSHOT=True, every screenshot is verified
+    (high quota cost â€” only feasible on a paid Gemini plan).
+
+    When False (default, free-tier friendly), verify only the checkpoints
+    that actually prove the test result:
+
+      * SCREENSHOT steps       (explicit checkpoint in the test data)
+      * The final step         (belt-and-braces, in case there's no SCREENSHOT)
+      * ASSERT_VISIBLE *or* WAIT_FOR immediately before a SCREENSHOT step
+                              (the exact frame where the error/confirmation
+                               is being asserted)
+
+    Everything else is skipped â€” this reduces per-test calls from ~11 to ~3.
+    """
+    if not AI_ENABLED:
+        return False
+    if AI_VERIFY_EVERY_SCREENSHOT:
+        return True
+
+    if cmd == "SCREENSHOT":
+        return True
+    if is_last_step:
+        return True
+
+    nxt = (next_parsed or {}).get("command")
+    # The step right before the SCREENSHOT is the one that proves the result.
+    if cmd in ("ASSERT_VISIBLE", "ASSERT_TEXT", "WAIT_FOR") and nxt == "SCREENSHOT":
+        return True
+
+    return False
+    
 # ---------------------------------------------------------------------------
 # Single test-case runner
 # ---------------------------------------------------------------------------
-def run_one_test(browser, test_case) -> TestExecutionResult:
+def run_one_test(browser, test_case, ai_call_budget=None) -> TestExecutionResult:
     context = browser.new_context()
     page = context.new_page()
 
@@ -514,22 +1303,37 @@ def run_one_test(browser, test_case) -> TestExecutionResult:
             parsed_steps.append((line.strip(), p))
 
     step_results: list[StepResult] = []
-    test_status = "PASS"
+    deterministic_status = "PASS"
     failure_reason = None
     test_start = time.perf_counter()
-
     total = len(parsed_steps)
+
+    # Tracks the "focus element" across steps so SCREENSHOT steps inherit
+    # the previous step's framing (e.g. a validation error).
+    last_focus: str | None = None
 
     for idx, (raw_step, parsed) in enumerate(parsed_steps, start=1):
         next_parsed = parsed_steps[idx][1] if idx < total else None
+        cmd = parsed.get("command")
 
         sr = StepResult(
             step_number=idx,
-            command=parsed.get("command", "?"),
+            command=cmd or "?",
             raw_step=raw_step,
             target=parsed.get("target"),
             value=parsed.get("value"),
         )
+
+        # --- Decide what the viewport should focus on for THIS step -------
+        if cmd == "OPEN":
+            last_focus = None
+            scroll_target = None
+        elif cmd == "SCREENSHOT":
+            scroll_target = last_focus
+        else:
+            scroll_target = _compute_scroll_target(parsed, next_parsed)
+            if scroll_target:
+                last_focus = scroll_target
 
         step_start = time.perf_counter()
         try:
@@ -539,30 +1343,33 @@ def run_one_test(browser, test_case) -> TestExecutionResult:
             # 2. Wait for the app to reach a relevant, stable state (Bug #1 fix)
             settle_after_step(page, parsed, next_parsed)
 
-            # 3. Screenshot after EVERY step
+            # 3. Screenshot after EVERY step. Centre-scroll the focus element
+            #    so small validation errors are always fully visible.
             label = ""
-            if parsed.get("command") == "SCREENSHOT" and parsed.get("target"):
+            if cmd == "SCREENSHOT" and parsed.get("target"):
                 label = parsed["target"]
+
             sr.screenshot_path = capture_screenshot(
-                page, test_case.test_id, idx, label
+                page, test_case.test_id, idx, label, scroll_target=scroll_target
             )
 
             sr.status = "PASS"
             print(f"  [OK]  Step {idx}/{total}  {_human_step_label(parsed, raw_step)}")
+            if sr.screenshot_path:
+                print(f"         shot: {sr.screenshot_path}")
 
         except Exception as e:
             sr.status = "FAIL"
             sr.error_message = str(e)
-            test_status = "FAIL"
-            failure_reason = (
-                f"Step {idx} ({parsed.get('command')}): {e}"
-            )
+            deterministic_status = "FAIL"
+            failure_reason = f"Step {idx} ({cmd}): {e}"
 
-            # Failure screenshot
+            # Failure screenshot - still try to centre on the failure target.
             _briefly_settle_for_failure(page)
             try:
                 sr.screenshot_path = capture_screenshot(
-                    page, test_case.test_id, idx, "FAILED"
+                    page, test_case.test_id, idx, "FAILED",
+                    scroll_target=parsed.get("target") or last_focus,
                 )
             except Exception:
                 pass
@@ -572,21 +1379,85 @@ def run_one_test(browser, test_case) -> TestExecutionResult:
             if sr.screenshot_path:
                 print(f"         -> screenshot: {sr.screenshot_path}")
 
-        finally:
-            sr.duration_ms = int((time.perf_counter() - step_start) * 1000)
-            step_results.append(sr)
+        # ---------------- AI Vision verification ---------------------------
+        is_last_step = (idx == total)
+        if sr.screenshot_path and _should_verify_with_ai(cmd, next_parsed, is_last_step):
+            budget_ok = (
+                ai_call_budget is None
+                or ai_call_budget["remaining"] > 0
+            )
 
-        # Stop executing further steps of this test on failure, but
-        # DO NOT abort the whole run - the caller moves to the next test.
+            if not budget_ok:
+                sr.ai_status = "NOT RUN"
+                sr.ai_observation = "AI call budget for this run exhausted."
+                print(f"         AI: NOT RUN - run budget exhausted")
+            else:
+                if ai_call_budget is not None:
+                    ai_call_budget["remaining"] -= 1
+
+                expectation = get_step_visual_expectation(
+                    test_id=test_case.test_id,
+                    test_name=test_case.test_name,
+                    category=test_case.category,
+                    command=cmd or "",
+                    target=parsed.get("target"),
+                    value=parsed.get("value"),
+                    overall_expected_result=test_case.expected_result,
+                )
+
+                ai_result = verify_step(
+                    screenshot_path=sr.screenshot_path,
+                    test_id=test_case.test_id,
+                    test_name=test_case.test_name,
+                    category=test_case.category,
+                    step_number=idx,
+                    step_command=cmd or "",
+                    step_target=parsed.get("target"),
+                    step_value=parsed.get("value"),
+                    expected_result=test_case.expected_result,
+                    step_expectation=expectation,
+                )
+
+                sr.ai_status = ai_result.status
+                sr.ai_confidence = ai_result.confidence
+                sr.ai_observation = ai_result.observation
+
+                conf_str = (
+                    f"{int(ai_result.confidence * 100)}%"
+                    if ai_result.confidence is not None
+                    else "n/a"
+                )
+                print(f"         AI: {ai_result.status} ({conf_str}) "
+                      f"- {ai_result.observation or ''}")
+
+        elif sr.screenshot_path:
+            sr.ai_status = "NOT RUN"
+
+        sr.duration_ms = int((time.perf_counter() - step_start) * 1000)
+        step_results.append(sr)
+
+        # Stop executing further steps of THIS test on failure, but the
+        # caller moves on to the next test.
         if sr.status == "FAIL":
             break
 
     test_duration_ms = int((time.perf_counter() - test_start) * 1000)
 
-    if test_status == "PASS":
-        print(f"  PASS  ({len(step_results)} steps, {test_duration_ms/1000:.1f}s)")
-    else:
-        print(f"  FAIL  ({len(step_results)} steps, {test_duration_ms/1000:.1f}s)")
+    # ---------------- Final aggregation (deterministic + AI) --------------
+    final_status, ai_status, ai_summary = aggregate_final_status(
+        deterministic_status=deterministic_status,
+        step_results=step_results,
+    )
+
+    ai_pass = sum(1 for s in step_results if s.ai_status == "PASS")
+    ai_fail = sum(1 for s in step_results if s.ai_status == "FAIL")
+    ai_unc  = sum(1 for s in step_results if s.ai_status == "UNCERTAIN")
+    ai_nr   = sum(1 for s in step_results if (s.ai_status or "NOT RUN") == "NOT RUN")
+
+    print(
+        f"  {final_status}  ({len(step_results)} steps, {test_duration_ms/1000:.1f}s) "
+        f"| AI: {ai_status} [PASS:{ai_pass} FAIL:{ai_fail} UNCERTAIN:{ai_unc} NOT RUN:{ai_nr}]"
+    )
 
     context.close()
 
@@ -595,12 +1466,17 @@ def run_one_test(browser, test_case) -> TestExecutionResult:
         test_name=test_case.test_name,
         category=test_case.category,
         expected_result=test_case.expected_result,
-        status=test_status,
+        status=final_status,
         step_results=step_results,
         failure_reason=failure_reason,
         duration_ms=test_duration_ms,
-        ai_status="NOT RUN",
-        ai_observation=None,
+        ai_status=ai_status,
+        ai_observation=ai_summary,
+        ai_pass_count=ai_pass,
+        ai_fail_count=ai_fail,
+        ai_uncertain_count=ai_unc,
+        ai_not_run_count=ai_nr,
+        deterministic_status=deterministic_status,
     )
 
 
@@ -609,13 +1485,19 @@ def run_one_test(browser, test_case) -> TestExecutionResult:
 # ---------------------------------------------------------------------------
 def run_tests() -> list[TestExecutionResult]:
     print("=" * 60)
-    print("AI HOTEL TEST AUTOMATION - PART 3 (Stage 1)")
+    print("AI HOTEL TEST AUTOMATION - PART 4 (AI VISION)")
     print("=" * 60)
-    print(f"Excel:     {EXCEL_FILE}")
-    print(f"Base URL:  {BASE_URL}")
-    print(f"Headless:  {HEADLESS}")
-    print(f"Run ID:    {Path(SCREENSHOT_DIR).name}")
-    print(f"Shots ->   {SCREENSHOT_DIR}")
+    print(f"Excel:      {EXCEL_FILE}")
+    print(f"Base URL:   {BASE_URL}")
+    print(f"Headless:   {HEADLESS}")
+    print(f"Run ID:     {Path(SCREENSHOT_DIR).name}")
+    print(f"Shots ->    {SCREENSHOT_DIR}")
+    print(f"AI Enabled: {AI_ENABLED}")
+    print(f"AI Verify Every Screenshot: {AI_VERIFY_EVERY_SCREENSHOT}")
+    if AI_MAX_CALLS_PER_RUN > 0:
+        print(f"AI Call Budget This Run:    {AI_MAX_CALLS_PER_RUN}")
+    else:
+        print(f"AI Call Budget This Run:    unlimited")
     print("")
 
     try:
@@ -625,6 +1507,11 @@ def run_tests() -> list[TestExecutionResult]:
         return []
 
     print(f"Tests found: {len(test_cases)}\n")
+
+    # Shared AI call budget across the whole run.
+    ai_call_budget = {
+        "remaining": AI_MAX_CALLS_PER_RUN if AI_MAX_CALLS_PER_RUN > 0 else 10**9
+    }
 
     results: list[TestExecutionResult] = []
     passed = failed = 0
@@ -639,7 +1526,7 @@ def run_tests() -> list[TestExecutionResult]:
         for tc in test_cases:
             print(f"Running {tc.test_id} - {tc.test_name}")
             try:
-                result = run_one_test(browser, tc)
+                result = run_one_test(browser, tc, ai_call_budget)
             except Exception as e:
                 print(f"  [ERROR] {tc.test_id} crashed at orchestrator level: {e}")
                 result = TestExecutionResult(
@@ -651,6 +1538,7 @@ def run_tests() -> list[TestExecutionResult]:
                     step_results=[],
                     failure_reason=f"Orchestrator error: {e}",
                     ai_status="NOT RUN",
+                    ai_observation="Orchestrator error before AI verification.",
                 )
             results.append(result)
             if result.status == "PASS":
@@ -661,7 +1549,11 @@ def run_tests() -> list[TestExecutionResult]:
 
         browser.close()
 
-    # ----- Summary ----------------------------------------------------------
+    # ----- Excel write-back ------------------------------------------------
+    print("-" * 60)
+    write_results(results)
+
+    # ----- Summary ---------------------------------------------------------
     print("=" * 60)
     print("EXECUTION SUMMARY")
     print("=" * 60)
@@ -671,7 +1563,10 @@ def run_tests() -> list[TestExecutionResult]:
     print(f"Skipped:  0")
     print("")
     print(f"Screenshots: {SCREENSHOT_DIR}")
-    print("AI Verification: NOT IMPLEMENTED YET (Part 3 Stage 2)")
+    print(f"AI Verification: {'ENABLED' if AI_ENABLED else 'DISABLED'}")
+    if AI_MAX_CALLS_PER_RUN > 0:
+        used = AI_MAX_CALLS_PER_RUN - ai_call_budget["remaining"]
+        print(f"AI Calls Used:   {used} / {AI_MAX_CALLS_PER_RUN}")
     print("=" * 60)
 
     return results
@@ -690,23 +1585,20 @@ from typing import List, Optional
 
 @dataclass
 class StepResult:
-    """Structured result for a single executed step.
-
-    This is the unit that Stage 2 (AI Vision) will consume.
-    """
+    """Structured result for a single executed step."""
     step_number: int
-    command: str                       # e.g. "CLICK", "FILL"
-    raw_step: str                      # original line from Excel
+    command: str
+    raw_step: str
     target: Optional[str] = None
     value: Optional[str] = None
-    status: str = "NOT RUN"            # PASS / FAIL
+    status: str = "NOT RUN"
     screenshot_path: Optional[str] = None
     error_message: Optional[str] = None
     duration_ms: int = 0
 
-    # ---- AI hooks (Stage 2) ------------------------------------------------
-    ai_status: Optional[str] = None    # PASS / FAIL / UNCERTAIN / NOT RUN
-    ai_confidence: Optional[float] = None
+    # ---- AI Vision hooks (Part 4) -----------------------------------------
+    ai_status: Optional[str] = None          # PASS / FAIL / UNCERTAIN / NOT RUN
+    ai_confidence: Optional[float] = None    # 0.0 - 1.0
     ai_observation: Optional[str] = None
 
 
@@ -727,12 +1619,23 @@ class TestExecutionResult:
     test_name: str
     category: str
     expected_result: str
-    status: str                        # PASS / FAIL
+    status: str                              # PASS / FAIL (final aggregated)
     step_results: List[StepResult] = field(default_factory=list)
     failure_reason: Optional[str] = None
     duration_ms: int = 0
-    ai_status: Optional[str] = None
+
+    # ---- AI Vision summary (Part 4) ---------------------------------------
+    ai_status: Optional[str] = None          # PASS / FAIL / UNCERTAIN / NOT RUN
     ai_observation: Optional[str] = None
+
+    # Aggregate counts (for Excel summary)
+    ai_pass_count: int = 0
+    ai_fail_count: int = 0
+    ai_uncertain_count: int = 0
+    ai_not_run_count: int = 0
+
+    # Raw deterministic status before AI aggregation
+    deterministic_status: Optional[str] = None
 
 
 ================================================
@@ -740,6 +1643,7 @@ FILE: automation/requirements.txt
 ================================================
 playwright
 openpyxl
+google-genai
 
 
 ================================================
@@ -750,7 +1654,12 @@ from pathlib import Path
 
 from playwright.sync_api import Page
 
-from config import SCREENSHOT_DIR
+from config import (
+    SCREENSHOT_DIR,
+    SCROLL_BEFORE_SCREENSHOT,
+    SCROLL_TIMEOUT_MS,
+    SCROLL_SETTLE_MS,
+)
 
 _INVALID = re.compile(r"[^A-Za-z0-9._-]+")
 
@@ -773,17 +1682,86 @@ def _normalize_label(test_id: str, label: str) -> str:
     return _safe(label)
 
 
+# ---------------------------------------------------------------------------
+# Focus / scroll helpers  (the real Bug #1 fix for small error elements)
+# ---------------------------------------------------------------------------
+def _candidate_testids(test_id: str) -> list[str]:
+    """
+    Given a focus testid, return a list of fallbacks to try, in order.
+
+    For a validation-error testid like `booking-guests-error`, we also try
+    the corresponding input (`booking-guests-input`). Scrolling to the input
+    naturally shows the error message sitting directly beneath it, which is
+    a good second-best framing when the tiny error element itself is hard
+    to centre cleanly.
+    """
+    candidates = [test_id]
+    if test_id.endswith("-error"):
+        candidates.append(test_id[: -len("-error")] + "-input")
+    return candidates
+
+
+def _force_center_scroll(page: Page, test_id: str) -> bool:
+    """
+    Scroll the element with the given data-testid to the CENTRE of the
+    viewport.
+
+    Why centre and not 'into view'?
+      Playwright's default `scroll_into_view_if_needed()` uses the browser's
+      minimum-scroll behaviour. For a small element (like a one-line error
+      paragraph) this can leave the element pinned to the very bottom of
+      the viewport, clipped, or hidden behind the sticky navbar. Centring
+      guarantees it's fully visible regardless of viewport size.
+
+    Returns True on success, False if the element couldn't be found / shown.
+    """
+    try:
+        loc = page.get_by_test_id(test_id).first
+        if loc.count() == 0:
+            return False
+        # Ensure it's attached + visible before scrolling to it.
+        loc.wait_for(state="visible", timeout=SCROLL_TIMEOUT_MS)
+        loc.evaluate(
+            "el => el.scrollIntoView({block: 'center', inline: 'nearest', "
+            "behavior: 'instant'})"
+        )
+        page.wait_for_timeout(SCROLL_SETTLE_MS)
+        return True
+    except Exception:
+        return False
+
+
+def _focus_element(page: Page, test_id: str) -> None:
+    """Try each candidate testid in order; stop at first success."""
+    if not test_id:
+        return
+    for candidate in _candidate_testids(test_id):
+        if _force_center_scroll(page, candidate):
+            return
+    # If nothing worked, don't fail the screenshot - just proceed with the
+    # current viewport. (A missing focus target is not a test failure.)
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 def capture_screenshot(
     page: Page,
     test_id: str,
     step_number: int,
     label: str = "",
+    scroll_target: str | None = None,
 ) -> str:
     """
     Save a screenshot under:
         screenshots/run_<RUN_ID>/<test_id>/<test_id>_step-NN[_label].png
-    Returns the absolute path as a string (safe for JSON serialization).
+
+    If `scroll_target` is provided, that element (or a nearby fallback) is
+    centred in the viewport before the screenshot.
     """
+    if SCROLL_BEFORE_SCREENSHOT and scroll_target:
+        _focus_element(page, scroll_target)
+
     test_dir = Path(SCREENSHOT_DIR) / test_id
     test_dir.mkdir(parents=True, exist_ok=True)
 
@@ -835,6 +1813,168 @@ def parse_step(raw_step: str) -> dict:
 
 
 ================================================
+FILE: automation/test_gemini.py
+================================================
+"""
+Standalone Gemini API diagnostic.
+
+Usage:
+  python test_gemini.py                       # auto-pick latest screenshot
+  python test_gemini.py path/to/screenshot.png
+"""
+import os
+import sys
+from pathlib import Path
+
+
+# Only models that are currently valid on Google's v1beta API.
+# gemini-1.5-* and gemini-2.0-flash have been retired â€” they will 404.
+CANDIDATE_MODELS = [
+    "gemini-2.5-flash",
+    "gemini-3-flash-preview",
+    "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-flash-latest",
+]
+
+
+def _redact(msg: str, key: str) -> str:
+    return msg.replace(key, "***REDACTED***") if key else msg
+
+
+def _shorten(msg: str, n: int = 200) -> str:
+    msg = " ".join(msg.split())
+    return msg if len(msg) <= n else msg[: n - 3] + "..."
+
+
+def main() -> int:
+    key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+
+    print("=" * 60)
+    print("GEMINI API DIAGNOSTIC")
+    print("=" * 60)
+    print(f"GEMINI_API_KEY set: {bool(os.getenv('GEMINI_API_KEY'))}")
+    print(f"GOOGLE_API_KEY set: {bool(os.getenv('GOOGLE_API_KEY'))}")
+
+    if not key:
+        print("\n[FAIL] No API key found.")
+        print('  Set it with: $env:GOOGLE_API_KEY="your-key"')
+        print("  Get a free key at: https://aistudio.google.com/apikey")
+        return 1
+
+    print(f"Key length:  {len(key)} chars")
+    print(f"Key preview: {key[:6]}...{key[-4:]}")
+
+    # --- Import SDK ------------------------------------------------------
+    try:
+        from google import genai  # type: ignore
+        from google.genai import types  # type: ignore
+        print("\n[OK]   google-genai SDK imported")
+    except ImportError as e:
+        print(f"\n[FAIL] google-genai not installed: {e}")
+        print("  Fix: pip install google-genai")
+        return 1
+
+    # --- Create client ---------------------------------------------------
+    try:
+        client = genai.Client(api_key=key)
+        print("[OK]   Client created")
+    except Exception as e:
+        print(f"\n[FAIL] Client creation failed: {_redact(str(e), key)}")
+        return 1
+
+    # --- List available models ------------------------------------------
+    print("\nListing models available to your key...")
+    listed = set()
+    try:
+        all_models = list(client.models.list())
+        print(f"  Found {len(all_models)} models total")
+        for m in all_models:
+            name = m.name.replace("models/", "", 1) if m.name else ""
+            if name:
+                listed.add(name)
+        vision_like = sorted(
+            n for n in listed if any(k in n.lower() for k in ("flash", "pro"))
+        )
+        if vision_like:
+            print("  Vision-capable candidates:")
+            for name in vision_like:
+                print(f"    - {name}")
+    except Exception as e:
+        print(f"\n[FAIL] Cannot list models: {_redact(str(e), key)}")
+        print("\n  Most likely causes:")
+        print("    1. API key is invalid / expired")
+        print("    2. Generative Language API not enabled:")
+        print("       https://console.cloud.google.com/apis/library/generativelanguage.googleapis.com")
+        return 1
+
+    # --- Pick a screenshot ----------------------------------------------
+    if len(sys.argv) > 1:
+        img_path = Path(sys.argv[1])
+    else:
+        shots_dir = Path(__file__).parent.parent / "screenshots"
+        candidates = sorted(shots_dir.glob("run_*/TC-*/TC-*_step-*.png"))
+        img_path = candidates[-1] if candidates else None
+
+    if not img_path or not img_path.exists():
+        print("\n[SKIP] No screenshot available to test with.")
+        print("       Pass one explicitly: python test_gemini.py path/to.png")
+        return 0
+
+    print(f"\nTrying a real vision call with: {img_path}")
+    img_bytes = img_path.read_bytes()
+    print(f"  Image size: {len(img_bytes):,} bytes")
+
+    # --- Try each candidate model ---------------------------------------
+    any_ok = False
+    working_models: list[str] = []
+
+    for model_name in CANDIDATE_MODELS:
+        # Skip models the key doesn't list at all (saves noisy 404s).
+        if listed and model_name not in listed:
+            print(f"  [SKIP] {model_name} (not listed for this key)")
+            continue
+
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=[
+                    types.Part.from_bytes(data=img_bytes, mime_type="image/png"),
+                    "Describe this screenshot in one short sentence.",
+                ],
+                config=types.GenerateContentConfig(temperature=0.0),
+            )
+            text = getattr(response, "text", None) or "(no text)"
+            print(f"  [OK]   {model_name}")
+            print(f"         {_shorten(text, 140)}")
+            any_ok = True
+            working_models.append(model_name)
+        except Exception as e:
+            err = _redact(str(e), key)
+            print(f"  [FAIL] {model_name}: {type(e).__name__}: {_shorten(err)}")
+
+    # --- Verdict ---------------------------------------------------------
+    print()
+    if any_ok:
+        print("[DONE] At least one model works.")
+        print(f"       Working models: {', '.join(working_models)}")
+        print()
+        print("       Set your primary model in automation/config.py to:")
+        print(f'           AI_MODEL = "{working_models[0]}"')
+        return 0
+
+    print("[FAIL] No candidate model worked.")
+    print("       Check that one of these exists in the list printed above:")
+    for m in CANDIDATE_MODELS:
+        print(f"         - {m}")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+
+================================================
 FILE: automation/waits.py
 ================================================
 from playwright.sync_api import Page
@@ -845,6 +1985,7 @@ from config import (
     POST_ACTION_SETTLE_MS,
     NETWORK_IDLE_TIMEOUT_MS,
     ANIMATION_SETTLE_TIMEOUT_MS,
+    REACT_CYCLE_TIMEOUT_MS,
 )
 
 
@@ -881,6 +2022,24 @@ def wait_for_document_ready(page: Page, timeout: int = DEFAULT_TIMEOUT) -> None:
         pass
 
 
+def wait_for_react_cycle(page: Page, timeout: int = REACT_CYCLE_TIMEOUT_MS) -> None:
+    """
+    Wait for React to finish its current render cycle.
+
+    Uses double requestAnimationFrame: React's scheduler flushes state
+    updates on microtasks, then the browser paints on the next RAF. Two
+    RAFs guarantee: state commit -> DOM mutation -> paint.
+    Cheap (<20ms in practice), bounded, and never throws.
+    """
+    try:
+        page.wait_for_function(
+            "() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))",
+            timeout=timeout,
+        )
+    except Exception:
+        pass
+
+
 def wait_for_network_settled(
     page: Page,
     timeout: int = NETWORK_IDLE_TIMEOUT_MS,
@@ -894,7 +2053,6 @@ def wait_for_network_settled(
         page.wait_for_load_state("networkidle", timeout=timeout)
     except Exception:
         pass
-    # tiny React flush buffer after network goes quiet
     page.wait_for_timeout(idle_ms)
 
 
@@ -945,9 +2103,10 @@ def wait_after_step(page: Page, parsed: dict, next_parsed: dict | None = None) -
         wait_for_animations(page)
 
     elif command == "CLICK":
-        # Click may trigger a route change OR just a local React state update.
-        # Bounded network wait covers both, then let animations finish.
+        # Click may trigger a route change, a submit-button validation render,
+        # OR just a local React state update. We cover all three:
         wait_for_network_settled(page, timeout=SHORT_TIMEOUT)
+        wait_for_react_cycle(page)          # catches form-submit validation
         wait_for_animations(page)
 
     elif command in ("FILL", "CLEAR", "SELECT"):
@@ -3594,6 +4753,18 @@ export function validateBookingForm(values) {
 
 ================================================
 FILE: test_cases/sample_test_cases.xlsx
+================================================
+[Non-text file]
+
+
+================================================
+FILE: test_cases/test_results.xlsx
+================================================
+[Non-text file]
+
+
+================================================
+FILE: test_cases/~$test_results.xlsx
 ================================================
 [Non-text file]
 

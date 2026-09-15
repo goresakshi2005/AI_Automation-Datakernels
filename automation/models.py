@@ -4,23 +4,20 @@ from typing import List, Optional
 
 @dataclass
 class StepResult:
-    """Structured result for a single executed step.
-
-    This is the unit that Stage 2 (AI Vision) will consume.
-    """
+    """Structured result for a single executed step."""
     step_number: int
-    command: str                       # e.g. "CLICK", "FILL"
-    raw_step: str                      # original line from Excel
+    command: str
+    raw_step: str
     target: Optional[str] = None
     value: Optional[str] = None
-    status: str = "NOT RUN"            # PASS / FAIL
+    status: str = "NOT RUN"
     screenshot_path: Optional[str] = None
     error_message: Optional[str] = None
     duration_ms: int = 0
 
-    # ---- AI hooks (Stage 2) ------------------------------------------------
-    ai_status: Optional[str] = None    # PASS / FAIL / UNCERTAIN / NOT RUN
-    ai_confidence: Optional[float] = None
+    # ---- AI Vision hooks (Part 4) -----------------------------------------
+    ai_status: Optional[str] = None          # PASS / FAIL / UNCERTAIN / NOT RUN
+    ai_confidence: Optional[float] = None    # 0.0 - 1.0
     ai_observation: Optional[str] = None
 
 
@@ -41,9 +38,20 @@ class TestExecutionResult:
     test_name: str
     category: str
     expected_result: str
-    status: str                        # PASS / FAIL
+    status: str                              # PASS / FAIL (final aggregated)
     step_results: List[StepResult] = field(default_factory=list)
     failure_reason: Optional[str] = None
     duration_ms: int = 0
-    ai_status: Optional[str] = None
+
+    # ---- AI Vision summary (Part 4) ---------------------------------------
+    ai_status: Optional[str] = None          # PASS / FAIL / UNCERTAIN / NOT RUN
     ai_observation: Optional[str] = None
+
+    # Aggregate counts (for Excel summary)
+    ai_pass_count: int = 0
+    ai_fail_count: int = 0
+    ai_uncertain_count: int = 0
+    ai_not_run_count: int = 0
+
+    # Raw deterministic status before AI aggregation
+    deterministic_status: Optional[str] = None

@@ -8,6 +8,9 @@ from config import (
     EXCEL_FILE,
     HEADLESS,
     SCREENSHOT_DIR,
+    AI_ENABLED,
+    AI_VERIFY_EVERY_SCREENSHOT,
+    AI_MAX_CALLS_PER_RUN,
 )
 from excel_reader import load_test_cases
 from excel_writer import write_results
@@ -16,6 +19,11 @@ from executor import execute_step, settle_after_step
 from screenshot_manager import capture_screenshot
 from models import StepResult, TestExecutionResult
 from waits import wait_for_animations
+from ai_verifier import (
+    verify_step,
+    get_step_visual_expectation,
+    aggregate_final_status,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -38,23 +46,19 @@ def _compute_scroll_target(parsed: dict, next_parsed: dict | None) -> str | None
 
     Priority:
       1. What the NEXT step is waiting for (that's the freshly rendered
-         content produced by the CURRENT action). This is what makes
-         validation-error screenshots land on the right element.
+         content produced by the CURRENT action).
       2. Otherwise, this step's own target.
       3. Otherwise, None (SCREENSHOT and OPEN are handled by the caller).
     """
     cmd = parsed.get("command")
     if cmd == "OPEN":
         return None
-
     if next_parsed and next_parsed.get("command") == "WAIT_FOR":
         return next_parsed.get("target")
-
     if cmd in ("FILL", "CLICK", "WAIT_FOR", "ASSERT_VISIBLE",
                "ASSERT_TEXT", "SELECT", "CLEAR"):
         return parsed.get("target")
-
-    return None  # SCREENSHOT handled separately by the caller
+    return None
 
 
 def _briefly_settle_for_failure(page) -> None:
@@ -66,10 +70,45 @@ def _briefly_settle_for_failure(page) -> None:
         pass
 
 
+def _should_verify_with_ai(cmd: str, next_parsed: dict | None, is_last_step: bool) -> bool:
+    """
+    Decide whether to send this step's screenshot to AI.
+
+    When AI_VERIFY_EVERY_SCREENSHOT=True, every screenshot is verified
+    (high quota cost — only feasible on a paid Gemini plan).
+
+    When False (default, free-tier friendly), verify only the checkpoints
+    that actually prove the test result:
+
+      * SCREENSHOT steps       (explicit checkpoint in the test data)
+      * The final step         (belt-and-braces, in case there's no SCREENSHOT)
+      * ASSERT_VISIBLE *or* WAIT_FOR immediately before a SCREENSHOT step
+                              (the exact frame where the error/confirmation
+                               is being asserted)
+
+    Everything else is skipped — this reduces per-test calls from ~11 to ~3.
+    """
+    if not AI_ENABLED:
+        return False
+    if AI_VERIFY_EVERY_SCREENSHOT:
+        return True
+
+    if cmd == "SCREENSHOT":
+        return True
+    if is_last_step:
+        return True
+
+    nxt = (next_parsed or {}).get("command")
+    # The step right before the SCREENSHOT is the one that proves the result.
+    if cmd in ("ASSERT_VISIBLE", "ASSERT_TEXT", "WAIT_FOR") and nxt == "SCREENSHOT":
+        return True
+
+    return False
+    
 # ---------------------------------------------------------------------------
 # Single test-case runner
 # ---------------------------------------------------------------------------
-def run_one_test(browser, test_case) -> TestExecutionResult:
+def run_one_test(browser, test_case, ai_call_budget=None) -> TestExecutionResult:
     context = browser.new_context()
     page = context.new_page()
 
@@ -81,14 +120,13 @@ def run_one_test(browser, test_case) -> TestExecutionResult:
             parsed_steps.append((line.strip(), p))
 
     step_results: list[StepResult] = []
-    test_status = "PASS"
+    deterministic_status = "PASS"
     failure_reason = None
     test_start = time.perf_counter()
-
     total = len(parsed_steps)
 
-    # Tracks the "focus element" carried across steps so SCREENSHOT steps
-    # inherit the previous step's framing (e.g. a validation error).
+    # Tracks the "focus element" across steps so SCREENSHOT steps inherit
+    # the previous step's framing (e.g. a validation error).
     last_focus: str | None = None
 
     for idx, (raw_step, parsed) in enumerate(parsed_steps, start=1):
@@ -105,12 +143,9 @@ def run_one_test(browser, test_case) -> TestExecutionResult:
 
         # --- Decide what the viewport should focus on for THIS step -------
         if cmd == "OPEN":
-            # New page load -> reset focus, show top of page.
             last_focus = None
             scroll_target = None
         elif cmd == "SCREENSHOT":
-            # Reuse the previous step's focus so we don't drift away from
-            # the element the test just validated.
             scroll_target = last_focus
         else:
             scroll_target = _compute_scroll_target(parsed, next_parsed)
@@ -137,11 +172,13 @@ def run_one_test(browser, test_case) -> TestExecutionResult:
 
             sr.status = "PASS"
             print(f"  [OK]  Step {idx}/{total}  {_human_step_label(parsed, raw_step)}")
+            if sr.screenshot_path:
+                print(f"         shot: {sr.screenshot_path}")
 
         except Exception as e:
             sr.status = "FAIL"
             sr.error_message = str(e)
-            test_status = "FAIL"
+            deterministic_status = "FAIL"
             failure_reason = f"Step {idx} ({cmd}): {e}"
 
             # Failure screenshot - still try to centre on the failure target.
@@ -159,19 +196,85 @@ def run_one_test(browser, test_case) -> TestExecutionResult:
             if sr.screenshot_path:
                 print(f"         -> screenshot: {sr.screenshot_path}")
 
-        finally:
-            sr.duration_ms = int((time.perf_counter() - step_start) * 1000)
-            step_results.append(sr)
+        # ---------------- AI Vision verification ---------------------------
+        is_last_step = (idx == total)
+        if sr.screenshot_path and _should_verify_with_ai(cmd, next_parsed, is_last_step):
+            budget_ok = (
+                ai_call_budget is None
+                or ai_call_budget["remaining"] > 0
+            )
 
+            if not budget_ok:
+                sr.ai_status = "NOT RUN"
+                sr.ai_observation = "AI call budget for this run exhausted."
+                print(f"         AI: NOT RUN - run budget exhausted")
+            else:
+                if ai_call_budget is not None:
+                    ai_call_budget["remaining"] -= 1
+
+                expectation = get_step_visual_expectation(
+                    test_id=test_case.test_id,
+                    test_name=test_case.test_name,
+                    category=test_case.category,
+                    command=cmd or "",
+                    target=parsed.get("target"),
+                    value=parsed.get("value"),
+                    overall_expected_result=test_case.expected_result,
+                )
+
+                ai_result = verify_step(
+                    screenshot_path=sr.screenshot_path,
+                    test_id=test_case.test_id,
+                    test_name=test_case.test_name,
+                    category=test_case.category,
+                    step_number=idx,
+                    step_command=cmd or "",
+                    step_target=parsed.get("target"),
+                    step_value=parsed.get("value"),
+                    expected_result=test_case.expected_result,
+                    step_expectation=expectation,
+                )
+
+                sr.ai_status = ai_result.status
+                sr.ai_confidence = ai_result.confidence
+                sr.ai_observation = ai_result.observation
+
+                conf_str = (
+                    f"{int(ai_result.confidence * 100)}%"
+                    if ai_result.confidence is not None
+                    else "n/a"
+                )
+                print(f"         AI: {ai_result.status} ({conf_str}) "
+                      f"- {ai_result.observation or ''}")
+
+        elif sr.screenshot_path:
+            sr.ai_status = "NOT RUN"
+
+        sr.duration_ms = int((time.perf_counter() - step_start) * 1000)
+        step_results.append(sr)
+
+        # Stop executing further steps of THIS test on failure, but the
+        # caller moves on to the next test.
         if sr.status == "FAIL":
             break
 
     test_duration_ms = int((time.perf_counter() - test_start) * 1000)
 
-    if test_status == "PASS":
-        print(f"  PASS  ({len(step_results)} steps, {test_duration_ms/1000:.1f}s)")
-    else:
-        print(f"  FAIL  ({len(step_results)} steps, {test_duration_ms/1000:.1f}s)")
+    # ---------------- Final aggregation (deterministic + AI) --------------
+    final_status, ai_status, ai_summary = aggregate_final_status(
+        deterministic_status=deterministic_status,
+        step_results=step_results,
+    )
+
+    ai_pass = sum(1 for s in step_results if s.ai_status == "PASS")
+    ai_fail = sum(1 for s in step_results if s.ai_status == "FAIL")
+    ai_unc  = sum(1 for s in step_results if s.ai_status == "UNCERTAIN")
+    ai_nr   = sum(1 for s in step_results if (s.ai_status or "NOT RUN") == "NOT RUN")
+
+    print(
+        f"  {final_status}  ({len(step_results)} steps, {test_duration_ms/1000:.1f}s) "
+        f"| AI: {ai_status} [PASS:{ai_pass} FAIL:{ai_fail} UNCERTAIN:{ai_unc} NOT RUN:{ai_nr}]"
+    )
 
     context.close()
 
@@ -180,12 +283,17 @@ def run_one_test(browser, test_case) -> TestExecutionResult:
         test_name=test_case.test_name,
         category=test_case.category,
         expected_result=test_case.expected_result,
-        status=test_status,
+        status=final_status,
         step_results=step_results,
         failure_reason=failure_reason,
         duration_ms=test_duration_ms,
-        ai_status="NOT RUN",
-        ai_observation=None,
+        ai_status=ai_status,
+        ai_observation=ai_summary,
+        ai_pass_count=ai_pass,
+        ai_fail_count=ai_fail,
+        ai_uncertain_count=ai_unc,
+        ai_not_run_count=ai_nr,
+        deterministic_status=deterministic_status,
     )
 
 
@@ -194,13 +302,19 @@ def run_one_test(browser, test_case) -> TestExecutionResult:
 # ---------------------------------------------------------------------------
 def run_tests() -> list[TestExecutionResult]:
     print("=" * 60)
-    print("AI HOTEL TEST AUTOMATION - PART 3 (Stage 1.2)")
+    print("AI HOTEL TEST AUTOMATION - PART 4 (AI VISION)")
     print("=" * 60)
-    print(f"Excel:     {EXCEL_FILE}")
-    print(f"Base URL:  {BASE_URL}")
-    print(f"Headless:  {HEADLESS}")
-    print(f"Run ID:    {Path(SCREENSHOT_DIR).name}")
-    print(f"Shots ->   {SCREENSHOT_DIR}")
+    print(f"Excel:      {EXCEL_FILE}")
+    print(f"Base URL:   {BASE_URL}")
+    print(f"Headless:   {HEADLESS}")
+    print(f"Run ID:     {Path(SCREENSHOT_DIR).name}")
+    print(f"Shots ->    {SCREENSHOT_DIR}")
+    print(f"AI Enabled: {AI_ENABLED}")
+    print(f"AI Verify Every Screenshot: {AI_VERIFY_EVERY_SCREENSHOT}")
+    if AI_MAX_CALLS_PER_RUN > 0:
+        print(f"AI Call Budget This Run:    {AI_MAX_CALLS_PER_RUN}")
+    else:
+        print(f"AI Call Budget This Run:    unlimited")
     print("")
 
     try:
@@ -210,6 +324,11 @@ def run_tests() -> list[TestExecutionResult]:
         return []
 
     print(f"Tests found: {len(test_cases)}\n")
+
+    # Shared AI call budget across the whole run.
+    ai_call_budget = {
+        "remaining": AI_MAX_CALLS_PER_RUN if AI_MAX_CALLS_PER_RUN > 0 else 10**9
+    }
 
     results: list[TestExecutionResult] = []
     passed = failed = 0
@@ -224,7 +343,7 @@ def run_tests() -> list[TestExecutionResult]:
         for tc in test_cases:
             print(f"Running {tc.test_id} - {tc.test_name}")
             try:
-                result = run_one_test(browser, tc)
+                result = run_one_test(browser, tc, ai_call_budget)
             except Exception as e:
                 print(f"  [ERROR] {tc.test_id} crashed at orchestrator level: {e}")
                 result = TestExecutionResult(
@@ -236,6 +355,7 @@ def run_tests() -> list[TestExecutionResult]:
                     step_results=[],
                     failure_reason=f"Orchestrator error: {e}",
                     ai_status="NOT RUN",
+                    ai_observation="Orchestrator error before AI verification.",
                 )
             results.append(result)
             if result.status == "PASS":
@@ -260,7 +380,10 @@ def run_tests() -> list[TestExecutionResult]:
     print(f"Skipped:  0")
     print("")
     print(f"Screenshots: {SCREENSHOT_DIR}")
-    print("AI Verification: NOT IMPLEMENTED YET (Part 3 Stage 2)")
+    print(f"AI Verification: {'ENABLED' if AI_ENABLED else 'DISABLED'}")
+    if AI_MAX_CALLS_PER_RUN > 0:
+        used = AI_MAX_CALLS_PER_RUN - ai_call_budget["remaining"]
+        print(f"AI Calls Used:   {used} / {AI_MAX_CALLS_PER_RUN}")
     print("=" * 60)
 
     return results

@@ -6,9 +6,6 @@ Two things happen:
      Status + AI Observation populated.
   2. The original `sample_test_cases.xlsx` is updated *in place* unless
      it's locked (open in Excel) - in which case we warn and continue.
-
-We deliberately load the workbook fresh from disk each time so that the
-Steps column (and everything else) is preserved exactly.
 """
 from pathlib import Path
 
@@ -22,6 +19,40 @@ def _load_source():
     if not src.exists():
         raise FileNotFoundError(f"Source workbook not found: {src}")
     return load_workbook(src)
+
+
+def _format_ai_observation(result) -> str:
+    """Build a concise AI Observation string for Excel."""
+    ai_status = (result.ai_status or "NOT RUN").upper()
+    counts = (
+        f"PASS:{result.ai_pass_count} "
+        f"FAIL:{result.ai_fail_count} "
+        f"UNCERTAIN:{result.ai_uncertain_count}"
+    )
+
+    # Try to surface the most informative per-step observation.
+    best_obs = None
+    for sr in result.step_results:
+        if sr.ai_status == "FAIL" and sr.ai_observation:
+            best_obs = sr.ai_observation
+            break
+    if best_obs is None:
+        for sr in result.step_results:
+            if sr.ai_status == "UNCERTAIN" and sr.ai_observation:
+                best_obs = sr.ai_observation
+                break
+    if best_obs is None:
+        for sr in result.step_results:
+            if sr.ai_status == "PASS" and sr.ai_observation:
+                best_obs = sr.ai_observation
+                break
+
+    if result.ai_observation:
+        summary = result.ai_observation
+    else:
+        summary = "No AI summary available."
+
+    return f"[{ai_status}] ({counts}) {summary}"[:500]
 
 
 def _update_sheet(ws, results) -> int:
@@ -53,11 +84,7 @@ def _update_sheet(ws, results) -> int:
             continue
 
         ws.cell(row=row, column=col_status).value = res.status
-        observation = (
-            res.ai_observation
-            or "AI verification not implemented yet (Part 3 Stage 2)."
-        )
-        ws.cell(row=row, column=col_ai).value = observation
+        ws.cell(row=row, column=col_ai).value = _format_ai_observation(res)
         updated += 1
 
     return updated

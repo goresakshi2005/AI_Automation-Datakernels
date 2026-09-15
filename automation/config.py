@@ -82,17 +82,14 @@ WRITE_BACK_TO_SOURCE = True
 # ---------------------------------------------------------------------------
 AI_ENABLED = True
 
-# Primary model — confirmed working on this API key by test_gemini.py.
-AI_MODEL = os.getenv("AI_MODEL", "gemini-2.5-flash")
+# Primary model — gemini-2.5-flash was deprecated; using recommended replacement.
+AI_MODEL = os.getenv("AI_MODEL", "gemini-3.6-flash")
 
-# Fallbacks — only models currently live on the v1beta API.
-# (gemini-1.5-*, gemini-2.0-flash, gemini-2.5-flash-lite, gemini-2.5-pro
-#  are deprecated for new users and return 404.)
-AI_MODEL_FALLBACKS = [
-    "gemini-3-flash-preview",
-    "gemini-3.5-flash",
-    "gemini-3.5-flash-lite",
-]
+# EMPTY fallback list: when the primary model hits quota (429), stop
+# immediately instead of cascading through other models. Preview models
+# have smaller quotas and would each burn another call, potentially
+# triggering Google's anti-abuse throttling at the account / IP level.
+AI_MODEL_FALLBACKS = []
 
 AI_CONFIDENCE_THRESHOLD = 0.80
 AI_MAX_RETRIES = 1
@@ -123,8 +120,8 @@ AI_MAX_CALLS_PER_RUN = 40
 AI_RESERVE_LAST_CALLS = 3
 
 # Minimum seconds between consecutive AI calls (RPM guard).
-# 6s ≈ 10 RPM — safer than 4s on the free tier.
-AI_MIN_SECONDS_BETWEEN_CALLS = 6.0
+# 8s ≈ 7.5 RPM — conservative for free tier to avoid 503 errors.
+AI_MIN_SECONDS_BETWEEN_CALLS = 8.0
 
 # Reads GEMINI_API_KEY first, falls back to GOOGLE_API_KEY.
 # Both come from either the shell env or automation/.env (loaded above).

@@ -12,7 +12,7 @@ from config import (
     SCREENSHOT_DIR,
     AI_ENABLED,
     AI_VERIFY_EVERY_SCREENSHOT,
-    AI_VERIFY_STRATEGY,          # ← NEW
+    AI_VERIFY_STRATEGY,
     AI_MAX_CALLS_PER_RUN,
     AI_RESERVE_LAST_CALLS,
 )
@@ -29,6 +29,15 @@ from ai_verifier import (
     aggregate_final_status,
 )
 from report_generator import generate_word_report
+
+
+# ---------------------------------------------------------------------------
+# Circuit breaker: once a 429 / quota error is seen anywhere in the run,
+# disable AI entirely for the rest of the run. This prevents cascading
+# fallback attempts from burning quota and tripping Google's anti-abuse
+# throttling at the account / IP level.
+# ---------------------------------------------------------------------------
+_ai_circuit_open = False
 
 
 # ---------------------------------------------------------------------------
@@ -91,11 +100,9 @@ def _should_verify_with_ai(cmd: str, next_parsed: dict | None, is_last_step: boo
         return True
 
     if strat == "final_only":
-        # Only the final step of the test is verified.
         return is_last_step
 
     if strat == "minimal":
-        # The final SCREENSHOT step is the sole checkpoint.
         if is_last_step:
             return True
         if cmd == "SCREENSHOT":
@@ -112,10 +119,28 @@ def _should_verify_with_ai(cmd: str, next_parsed: dict | None, is_last_step: boo
         return True
     return False
 
+
+def _is_quota_error(observation: str) -> bool:
+    """Detect whether an AI observation is a quota / rate-limit / server error
+    that should trip the circuit breaker for the rest of the run."""
+    if not observation:
+        return False
+    low = observation.lower()
+    return (
+        ("429" in observation)
+        or ("503" in observation)
+        or ("quota" in low)
+        or ("rate limit" in low)
+        or ("unavailable" in low and "after" in low and "attempts" in low)
+    )
+
+
 # ---------------------------------------------------------------------------
-# Single test-case runner (unchanged from Part 4)
+# Single test-case runner
 # ---------------------------------------------------------------------------
 def run_one_test(browser, test_case, ai_call_budget=None) -> TestExecutionResult:
+    global _ai_circuit_open
+
     context = browser.new_context()
     page = context.new_page()
 
@@ -131,6 +156,9 @@ def run_one_test(browser, test_case, ai_call_budget=None) -> TestExecutionResult
     failure_reason = None
     test_start = time.perf_counter()
     total = len(parsed_steps)
+
+    # Tracks the "focus element" across steps so SCREENSHOT steps inherit
+    # the previous step's framing (e.g. a validation error).
     last_focus: str | None = None
 
     for idx, (raw_step, parsed) in enumerate(parsed_steps, start=1):
@@ -145,6 +173,7 @@ def run_one_test(browser, test_case, ai_call_budget=None) -> TestExecutionResult
             value=parsed.get("value"),
         )
 
+        # --- Decide what the viewport should focus on for THIS step ------
         if cmd == "OPEN":
             last_focus = None
             scroll_target = None
@@ -193,8 +222,18 @@ def run_one_test(browser, test_case, ai_call_budget=None) -> TestExecutionResult
                 print(f"         -> screenshot: {sr.screenshot_path}")
 
         # ---------------- AI Vision verification ---------------------------
+        # NOTE: this line MUST be at 8 spaces, NOT 16. Earlier versions had
+        # it accidentally indented inside the `except` block above, causing
+        # a NameError on every successful step.
         is_last_step = (idx == total)
-        if sr.screenshot_path and _should_verify_with_ai(cmd, next_parsed, is_last_step):
+
+        # --- Circuit breaker: quota already blown earlier this run --------
+        if _ai_circuit_open:
+            sr.ai_status = "NOT RUN"
+            sr.ai_observation = "AI disabled: quota exhausted earlier in this run."
+
+        # --- Normal AI verification path ----------------------------------
+        elif sr.screenshot_path and _should_verify_with_ai(cmd, next_parsed, is_last_step):
             # Reserve a few calls so the run doesn't strand mid-test.
             remaining = (
                 ai_call_budget["remaining"] if ai_call_budget is not None else 10**9
@@ -246,6 +285,16 @@ def run_one_test(browser, test_case, ai_call_budget=None) -> TestExecutionResult
                 print(f"         AI: {ai_result.status} ({conf_str}) "
                       f"- {ai_result.observation or ''}")
 
+                # --- Circuit breaker trigger ------------------------------
+                # On a quota error, stop trying AI for the rest of the run.
+                if (
+                    ai_result.status == "UNCERTAIN"
+                    and _is_quota_error(ai_result.observation or "")
+                ):
+                    _ai_circuit_open = True
+                    print("         AI: CIRCUIT OPEN — quota exhausted, "
+                          "no further AI calls this run")
+
         elif sr.screenshot_path:
             sr.ai_status = "NOT RUN"
 
@@ -257,6 +306,7 @@ def run_one_test(browser, test_case, ai_call_budget=None) -> TestExecutionResult
 
     test_duration_ms = int((time.perf_counter() - test_start) * 1000)
 
+    # ---------------- Final aggregation (deterministic + AI) --------------
     final_status, ai_status, ai_summary = aggregate_final_status(
         deterministic_status=deterministic_status,
         step_results=step_results,
@@ -297,6 +347,9 @@ def run_one_test(browser, test_case, ai_call_budget=None) -> TestExecutionResult
 # Entry point
 # ---------------------------------------------------------------------------
 def run_tests() -> list[TestExecutionResult]:
+    global _ai_circuit_open
+    _ai_circuit_open = False  # reset in case the module is re-used
+
     print("=" * 60)
     print("AI HOTEL TEST AUTOMATION - PART 5 (EXCEL RESULT UPDATE)")
     print("=" * 60)
@@ -391,7 +444,6 @@ def run_tests() -> list[TestExecutionResult]:
     # ----- Final summary --------------------------------------------------
     print("=" * 60)
     print("TEST EXECUTION COMPLETE")
-
     print("=" * 60)
     print(f"Total:    {len(results)}")
     print(f"Passed:   {passed}")
@@ -412,6 +464,8 @@ def run_tests() -> list[TestExecutionResult]:
     print("")
     print(f"Screenshots: {SCREENSHOT_DIR}")
     print(f"AI Verification: {'ENABLED' if AI_ENABLED else 'DISABLED'}")
+    if _ai_circuit_open:
+        print("AI Circuit:      OPEN (quota exhausted mid-run)")
     if AI_MAX_CALLS_PER_RUN > 0:
         used = AI_MAX_CALLS_PER_RUN - ai_call_budget["remaining"]
         print(f"AI Calls Used:   {used} / {AI_MAX_CALLS_PER_RUN}")

@@ -441,6 +441,10 @@ def verify_step(
     last_error = "unknown error"
     last_code = 0
 
+    # Max retries specifically for transient 503 errors, with backoff.
+    _503_MAX_RETRIES = 3
+    _503_BASE_DELAY = 2.0  # seconds; doubles each retry → 2s, 4s, 8s
+
     for model_name in models_to_try:
         for attempt in range(AI_MAX_RETRIES + 1):
             try:
@@ -461,18 +465,25 @@ def verify_step(
                 last_code = code
                 last_error = f"model {model_name}: {_safe_error(e)}"
 
-                # 429 / 503 -> quota or server-side issue; trying other models
-                # will just burn the daily budget. Stop immediately.
-                if code in (429, 503):
-                    if code == 429:
-                        return AIVerification(
-                            "UNCERTAIN", None,
-                            "AI quota exhausted (429). Reduce AI_VERIFY_EVERY_SCREENSHOT "
-                            "or wait for quota reset. " + last_error,
-                        )
+                # 429 -> quota exhausted; stop immediately.
+                if code == 429:
                     return AIVerification(
                         "UNCERTAIN", None,
-                        "AI service temporarily unavailable (503). " + last_error,
+                        "AI quota exhausted (429). Reduce AI_VERIFY_EVERY_SCREENSHOT "
+                        "or wait for quota reset. " + last_error,
+                    )
+
+                # 503 -> transient server error; retry with exponential backoff.
+                if code == 503:
+                    if attempt < _503_MAX_RETRIES:
+                        backoff = _503_BASE_DELAY * (2 ** attempt)
+                        time.sleep(backoff)
+                        continue  # retry same model
+                    # Retries exhausted — give up on this model (and all models).
+                    return AIVerification(
+                        "UNCERTAIN", None,
+                        f"AI service unavailable (503) after {_503_MAX_RETRIES + 1} "
+                        f"attempts with backoff. " + last_error,
                     )
 
                 # 404 -> wrong model name; try next fallback.

@@ -1,0 +1,45 @@
+# =============================================================
+# Docker Compose — Hotel Booking Website + Automation Tool
+# =============================================================
+
+services:
+  # -----------------------------------------------------------
+  # Hotel Booking Website (Vite React)
+  # -----------------------------------------------------------
+  website:
+    build:
+      context: .
+      dockerfile: Dockerfile.website
+    ports:
+      - "5173:5173"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:5173"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+
+  # -----------------------------------------------------------
+  # Playwright Automation Tool
+  # -----------------------------------------------------------
+  automation:
+    build:
+      context: .
+      dockerfile: Dockerfile.automation
+    depends_on:
+      website:
+        condition: service_healthy
+    environment:
+      - BASE_URL=http://website:5173
+      - HEADLESS=true
+    env_file:
+      - ./automation/.env
+    volumes:
+      # Mount at the paths the Python code actually reads:
+      #   config.py computes PROJECT_ROOT = "/"
+      #   TEST_CASES_DIR = "/test_cases"
+      #   SCREENSHOT_DIR = "/screenshots/run_<timestamp>"
+      - ./test_cases:/test_cases
+      - ./screenshots:/screenshots
+    restart: "no"

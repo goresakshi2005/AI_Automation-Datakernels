@@ -1,5 +1,9 @@
 Directory structure:
 └── AI Automation - Datakernels/
+    ├── docker-compose.yml
+    ├── Dockerfile.automation
+    ├── Dockerfile.website
+    ├── .dockerignore
     ├── automation/
     │   ├── ai_verifier.py
     │   ├── config.py
@@ -51,9 +55,159 @@ Directory structure:
         ├── sample_test_cases.xlsx
         ├── test_report.docx
         ├── test_report_smoke.docx
-        ├── test_results.xlsx
-        ├── ~$st_report.docx
-        └── ~$test_results.xlsx
+        └── test_results.xlsx
+
+================================================
+FILE: docker-compose.yml
+================================================
+# =============================================================
+# Docker Compose â€” Hotel Booking Website + Automation Tool
+# =============================================================
+
+services:
+  # -----------------------------------------------------------
+  # Hotel Booking Website (Vite React)
+  # -----------------------------------------------------------
+  website:
+    build:
+      context: .
+      dockerfile: Dockerfile.website
+    ports:
+      - "5173:5173"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:5173"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+
+  # -----------------------------------------------------------
+  # Playwright Automation Tool
+  # -----------------------------------------------------------
+  automation:
+    build:
+      context: .
+      dockerfile: Dockerfile.automation
+    depends_on:
+      website:
+        condition: service_healthy
+    environment:
+      - BASE_URL=http://website:5173
+      - HEADLESS=true
+    env_file:
+      - ./automation/.env
+    volumes:
+      # Mount at the paths the Python code actually reads:
+      #   config.py computes PROJECT_ROOT = "/"
+      #   TEST_CASES_DIR = "/test_cases"
+      #   SCREENSHOT_DIR = "/screenshots/run_<timestamp>"
+      - ./test_cases:/test_cases
+      - ./screenshots:/screenshots
+    restart: "no"
+
+
+================================================
+FILE: Dockerfile.automation
+================================================
+# ---------- Stage: Automation Tool ----------
+# Runs the Playwright + Gemini AI test automation suite
+# in headless Chromium mode inside Docker.
+
+FROM python:3.12-slim
+
+# System deps needed by Playwright's Chromium
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Install Python deps
+COPY automation/requirements.txt ./requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Install Playwright browsers (Chromium only to keep image small)
+RUN playwright install --with-deps chromium
+
+# Copy automation source
+COPY automation/ ./
+
+# test_cases and screenshots are volume-mounted at runtime
+# so results persist on the host.
+
+# Default env vars (overridden by docker-compose.yml)
+ENV BASE_URL=http://website:5173
+ENV HEADLESS=true
+
+ENTRYPOINT ["python", "main.py"]
+
+
+
+================================================
+FILE: Dockerfile.website
+================================================
+# ---------- Stage: Hotel Booking Website ----------
+# Serves the Vite React app on port 5173, accessible
+# across the Docker network so the automation container
+# can reach it at http://website:5173.
+
+FROM node:22-alpine
+
+WORKDIR /app
+
+# Install deps first (layer cache)
+COPY Hotel_Booking/package.json Hotel_Booking/package-lock.json ./
+RUN npm ci
+
+# Copy source
+COPY Hotel_Booking/ ./
+
+# Vite dev server must bind to 0.0.0.0 to be reachable
+# from other containers on the Docker network.
+EXPOSE 5173
+
+CMD ["npm", "run", "dev", "--", "--host", "0.0.0.0"]
+
+
+
+================================================
+FILE: .dockerignore
+================================================
+# Git
+.git
+.gitignore
+
+# Dependencies (rebuilt inside containers)
+node_modules
+venv
+automation/venv
+Hotel_Booking/venv
+Hotel_Booking/node_modules
+__pycache__
+*.pyc
+
+# Runtime artifacts
+screenshots
+*.log
+*.tmp
+*.bak
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# System
+.DS_Store
+Thumbs.db
+
+# Large files
+digest.txt
+test_cases/*.docx
+
+
 
 ================================================
 FILE: automation/ai_verifier.py
@@ -501,6 +655,10 @@ def verify_step(
     last_error = "unknown error"
     last_code = 0
 
+    # Max retries specifically for transient 503 errors, with backoff.
+    _503_MAX_RETRIES = 3
+    _503_BASE_DELAY = 2.0  # seconds; doubles each retry â†’ 2s, 4s, 8s
+
     for model_name in models_to_try:
         for attempt in range(AI_MAX_RETRIES + 1):
             try:
@@ -521,18 +679,25 @@ def verify_step(
                 last_code = code
                 last_error = f"model {model_name}: {_safe_error(e)}"
 
-                # 429 / 503 -> quota or server-side issue; trying other models
-                # will just burn the daily budget. Stop immediately.
-                if code in (429, 503):
-                    if code == 429:
-                        return AIVerification(
-                            "UNCERTAIN", None,
-                            "AI quota exhausted (429). Reduce AI_VERIFY_EVERY_SCREENSHOT "
-                            "or wait for quota reset. " + last_error,
-                        )
+                # 429 -> quota exhausted; stop immediately.
+                if code == 429:
                     return AIVerification(
                         "UNCERTAIN", None,
-                        "AI service temporarily unavailable (503). " + last_error,
+                        "AI quota exhausted (429). Reduce AI_VERIFY_EVERY_SCREENSHOT "
+                        "or wait for quota reset. " + last_error,
+                    )
+
+                # 503 -> transient server error; retry with exponential backoff.
+                if code == 503:
+                    if attempt < _503_MAX_RETRIES:
+                        backoff = _503_BASE_DELAY * (2 ** attempt)
+                        time.sleep(backoff)
+                        continue  # retry same model
+                    # Retries exhausted â€” give up on this model (and all models).
+                    return AIVerification(
+                        "UNCERTAIN", None,
+                        f"AI service unavailable (503) after {_503_MAX_RETRIES + 1} "
+                        f"attempts with backoff. " + last_error,
                     )
 
                 # 404 -> wrong model name; try next fallback.
@@ -656,12 +821,12 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-BASE_URL = "http://localhost:5173"
+BASE_URL = os.getenv("BASE_URL", "http://localhost:5173")
 
 # ---------------------------------------------------------------------------
 # Browser / timeouts
 # ---------------------------------------------------------------------------
-HEADLESS = False
+HEADLESS = os.getenv("HEADLESS", "false").lower() in ("true", "1", "yes")
 DEFAULT_TIMEOUT = 10_000
 SHORT_TIMEOUT = 3_000
 MAX_RETRIES = 1
@@ -701,17 +866,14 @@ WRITE_BACK_TO_SOURCE = True
 # ---------------------------------------------------------------------------
 AI_ENABLED = True
 
-# Primary model — confirmed working on this API key by test_gemini.py.
-AI_MODEL = os.getenv("AI_MODEL", "gemini-2.5-flash")
+# Primary model — gemini-2.5-flash was deprecated; using recommended replacement.
+AI_MODEL = os.getenv("AI_MODEL", "gemini-3.6-flash")
 
-# Fallbacks — only models currently live on the v1beta API.
-# (gemini-1.5-*, gemini-2.0-flash, gemini-2.5-flash-lite, gemini-2.5-pro
-#  are deprecated for new users and return 404.)
-AI_MODEL_FALLBACKS = [
-    "gemini-3-flash-preview",
-    "gemini-3.5-flash",
-    "gemini-3.5-flash-lite",
-]
+# EMPTY fallback list: when the primary model hits quota (429), stop
+# immediately instead of cascading through other models. Preview models
+# have smaller quotas and would each burn another call, potentially
+# triggering Google's anti-abuse throttling at the account / IP level.
+AI_MODEL_FALLBACKS = []
 
 AI_CONFIDENCE_THRESHOLD = 0.80
 AI_MAX_RETRIES = 1
@@ -742,8 +904,8 @@ AI_MAX_CALLS_PER_RUN = 40
 AI_RESERVE_LAST_CALLS = 3
 
 # Minimum seconds between consecutive AI calls (RPM guard).
-# 6s ≈ 10 RPM — safer than 4s on the free tier.
-AI_MIN_SECONDS_BETWEEN_CALLS = 6.0
+# 8s ≈ 7.5 RPM — conservative for free tier to avoid 503 errors.
+AI_MIN_SECONDS_BETWEEN_CALLS = 8.0
 
 # Reads GEMINI_API_KEY first, falls back to GOOGLE_API_KEY.
 # Both come from either the shell env or automation/.env (loaded above).
@@ -1489,7 +1651,7 @@ from config import (
     SCREENSHOT_DIR,
     AI_ENABLED,
     AI_VERIFY_EVERY_SCREENSHOT,
-    AI_VERIFY_STRATEGY,          # ← NEW
+    AI_VERIFY_STRATEGY,
     AI_MAX_CALLS_PER_RUN,
     AI_RESERVE_LAST_CALLS,
 )
@@ -1506,6 +1668,15 @@ from ai_verifier import (
     aggregate_final_status,
 )
 from report_generator import generate_word_report
+
+
+# ---------------------------------------------------------------------------
+# Circuit breaker: once a 429 / quota error is seen anywhere in the run,
+# disable AI entirely for the rest of the run. This prevents cascading
+# fallback attempts from burning quota and tripping Google's anti-abuse
+# throttling at the account / IP level.
+# ---------------------------------------------------------------------------
+_ai_circuit_open = False
 
 
 # ---------------------------------------------------------------------------
@@ -1548,10 +1719,10 @@ def _should_verify_with_ai(cmd: str, next_parsed: dict | None, is_last_step: boo
 
     Controlled by AI_VERIFY_STRATEGY (config.py):
 
-      "final_only" — only the last step of each test            (~1 per test)
-      "minimal"    — SCREENSHOT step + the ASSERT right before it (~2 per test)
-      "standard"   — SCREENSHOT + final + the preceding ASSERT  (~3 per test)
-      "every"      — every screenshot                            (~all)
+      "final_only" â€” only the last step of each test            (~1 per test)
+      "minimal"    â€” SCREENSHOT step + the ASSERT right before it (~2 per test)
+      "standard"   â€” SCREENSHOT + final + the preceding ASSERT  (~3 per test)
+      "every"      â€” every screenshot                            (~all)
 
     Setting AI_VERIFY_EVERY_SCREENSHOT=True overrides the strategy and
     behaves like "every".
@@ -1568,11 +1739,9 @@ def _should_verify_with_ai(cmd: str, next_parsed: dict | None, is_last_step: boo
         return True
 
     if strat == "final_only":
-        # Only the final step of the test is verified.
         return is_last_step
 
     if strat == "minimal":
-        # The final SCREENSHOT step is the sole checkpoint.
         if is_last_step:
             return True
         if cmd == "SCREENSHOT":
@@ -1589,10 +1758,28 @@ def _should_verify_with_ai(cmd: str, next_parsed: dict | None, is_last_step: boo
         return True
     return False
 
+
+def _is_quota_error(observation: str) -> bool:
+    """Detect whether an AI observation is a quota / rate-limit / server error
+    that should trip the circuit breaker for the rest of the run."""
+    if not observation:
+        return False
+    low = observation.lower()
+    return (
+        ("429" in observation)
+        or ("503" in observation)
+        or ("quota" in low)
+        or ("rate limit" in low)
+        or ("unavailable" in low and "after" in low and "attempts" in low)
+    )
+
+
 # ---------------------------------------------------------------------------
-# Single test-case runner (unchanged from Part 4)
+# Single test-case runner
 # ---------------------------------------------------------------------------
 def run_one_test(browser, test_case, ai_call_budget=None) -> TestExecutionResult:
+    global _ai_circuit_open
+
     context = browser.new_context()
     page = context.new_page()
 
@@ -1608,6 +1795,9 @@ def run_one_test(browser, test_case, ai_call_budget=None) -> TestExecutionResult
     failure_reason = None
     test_start = time.perf_counter()
     total = len(parsed_steps)
+
+    # Tracks the "focus element" across steps so SCREENSHOT steps inherit
+    # the previous step's framing (e.g. a validation error).
     last_focus: str | None = None
 
     for idx, (raw_step, parsed) in enumerate(parsed_steps, start=1):
@@ -1622,6 +1812,7 @@ def run_one_test(browser, test_case, ai_call_budget=None) -> TestExecutionResult
             value=parsed.get("value"),
         )
 
+        # --- Decide what the viewport should focus on for THIS step ------
         if cmd == "OPEN":
             last_focus = None
             scroll_target = None
@@ -1670,8 +1861,18 @@ def run_one_test(browser, test_case, ai_call_budget=None) -> TestExecutionResult
                 print(f"         -> screenshot: {sr.screenshot_path}")
 
         # ---------------- AI Vision verification ---------------------------
-                is_last_step = (idx == total)
-        if sr.screenshot_path and _should_verify_with_ai(cmd, next_parsed, is_last_step):
+        # NOTE: this line MUST be at 8 spaces, NOT 16. Earlier versions had
+        # it accidentally indented inside the `except` block above, causing
+        # a NameError on every successful step.
+        is_last_step = (idx == total)
+
+        # --- Circuit breaker: quota already blown earlier this run --------
+        if _ai_circuit_open:
+            sr.ai_status = "NOT RUN"
+            sr.ai_observation = "AI disabled: quota exhausted earlier in this run."
+
+        # --- Normal AI verification path ----------------------------------
+        elif sr.screenshot_path and _should_verify_with_ai(cmd, next_parsed, is_last_step):
             # Reserve a few calls so the run doesn't strand mid-test.
             remaining = (
                 ai_call_budget["remaining"] if ai_call_budget is not None else 10**9
@@ -1723,6 +1924,16 @@ def run_one_test(browser, test_case, ai_call_budget=None) -> TestExecutionResult
                 print(f"         AI: {ai_result.status} ({conf_str}) "
                       f"- {ai_result.observation or ''}")
 
+                # --- Circuit breaker trigger ------------------------------
+                # On a quota error, stop trying AI for the rest of the run.
+                if (
+                    ai_result.status == "UNCERTAIN"
+                    and _is_quota_error(ai_result.observation or "")
+                ):
+                    _ai_circuit_open = True
+                    print("         AI: CIRCUIT OPEN â€” quota exhausted, "
+                          "no further AI calls this run")
+
         elif sr.screenshot_path:
             sr.ai_status = "NOT RUN"
 
@@ -1734,6 +1945,7 @@ def run_one_test(browser, test_case, ai_call_budget=None) -> TestExecutionResult
 
     test_duration_ms = int((time.perf_counter() - test_start) * 1000)
 
+    # ---------------- Final aggregation (deterministic + AI) --------------
     final_status, ai_status, ai_summary = aggregate_final_status(
         deterministic_status=deterministic_status,
         step_results=step_results,
@@ -1774,6 +1986,9 @@ def run_one_test(browser, test_case, ai_call_budget=None) -> TestExecutionResult
 # Entry point
 # ---------------------------------------------------------------------------
 def run_tests() -> list[TestExecutionResult]:
+    global _ai_circuit_open
+    _ai_circuit_open = False  # reset in case the module is re-used
+
     print("=" * 60)
     print("AI HOTEL TEST AUTOMATION - PART 5 (EXCEL RESULT UPDATE)")
     print("=" * 60)
@@ -1839,7 +2054,7 @@ def run_tests() -> list[TestExecutionResult]:
                         )
 
                     results.append(result)
-                    # Per-test persistence (Part 5) — enqueue immediately.
+                    # Per-test persistence (Part 5) â€” enqueue immediately.
                     excel_writer.submit(result)
 
                     if result.status == "PASS":
@@ -1853,7 +2068,7 @@ def run_tests() -> list[TestExecutionResult]:
                 except Exception as e:
                     print(f"[WARN] browser.close() failed: {e}")
     finally:
-        # Always drain the queue — even if the browser or a test crashed.
+        # Always drain the queue â€” even if the browser or a test crashed.
         excel_writer.close()
 
     # ----- Word report (Part 6) -------------------------------------------
@@ -1868,7 +2083,6 @@ def run_tests() -> list[TestExecutionResult]:
     # ----- Final summary --------------------------------------------------
     print("=" * 60)
     print("TEST EXECUTION COMPLETE")
-
     print("=" * 60)
     print(f"Total:    {len(results)}")
     print(f"Passed:   {passed}")
@@ -1889,6 +2103,8 @@ def run_tests() -> list[TestExecutionResult]:
     print("")
     print(f"Screenshots: {SCREENSHOT_DIR}")
     print(f"AI Verification: {'ENABLED' if AI_ENABLED else 'DISABLED'}")
+    if _ai_circuit_open:
+        print("AI Circuit:      OPEN (quota exhausted mid-run)")
     if AI_MAX_CALLS_PER_RUN > 0:
         used = AI_MAX_CALLS_PER_RUN - ai_call_budget["remaining"]
         print(f"AI Calls Used:   {used} / {AI_MAX_CALLS_PER_RUN}")
@@ -5983,18 +6199,6 @@ FILE: test_cases/test_report_smoke.docx
 
 ================================================
 FILE: test_cases/test_results.xlsx
-================================================
-[Non-text file]
-
-
-================================================
-FILE: test_cases/~$st_report.docx
-================================================
-[Non-text file]
-
-
-================================================
-FILE: test_cases/~$test_results.xlsx
 ================================================
 [Non-text file]
 

@@ -37,12 +37,12 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-BASE_URL = "http://localhost:5173"
+BASE_URL = os.getenv("BASE_URL", "http://localhost:5173")
 
 # ---------------------------------------------------------------------------
 # Browser / timeouts
 # ---------------------------------------------------------------------------
-HEADLESS = False
+HEADLESS = os.getenv("HEADLESS", "false").lower() in ("true", "1", "yes")
 DEFAULT_TIMEOUT = 10_000
 SHORT_TIMEOUT = 3_000
 MAX_RETRIES = 1

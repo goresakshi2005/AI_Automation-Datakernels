@@ -1,0 +1,32 @@
+# Git
+.git
+.gitignore
+
+# Dependencies (rebuilt inside containers)
+node_modules
+venv
+automation/venv
+Hotel_Booking/venv
+Hotel_Booking/node_modules
+__pycache__
+*.pyc
+
+# Runtime artifacts
+screenshots
+*.log
+*.tmp
+*.bak
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# System
+.DS_Store
+Thumbs.db
+
+# Large files
+digest.txt
+test_cases/*.docx

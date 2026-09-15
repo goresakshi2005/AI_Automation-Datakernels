@@ -1,0 +1,31 @@
+# ---------- Stage: Automation Tool ----------
+# Runs the Playwright + Gemini AI test automation suite
+# in headless Chromium mode inside Docker.
+
+FROM python:3.12-slim
+
+# System deps needed by Playwright's Chromium
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Install Python deps
+COPY automation/requirements.txt ./requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Install Playwright browsers (Chromium only to keep image small)
+RUN playwright install --with-deps chromium
+
+# Copy automation source
+COPY automation/ ./
+
+# test_cases and screenshots are volume-mounted at runtime
+# so results persist on the host.
+
+# Default env vars (overridden by docker-compose.yml)
+ENV BASE_URL=http://website:5173
+ENV HEADLESS=true
+
+ENTRYPOINT ["python", "main.py"]

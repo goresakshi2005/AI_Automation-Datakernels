@@ -3,11 +3,40 @@ from datetime import datetime
 import os
 
 # ---------------------------------------------------------------------------
-# Paths
+# Load .env automatically (before reading any env vars below)
 # ---------------------------------------------------------------------------
+# python-dotenv reads KEY=value pairs from a .env file and exposes them via
+# os.getenv() for the lifetime of this Python process. This runs BEFORE any
+# os.getenv() call below, so the API key is available even when the shell
+# doesn't have GOOGLE_API_KEY set.
+#
+# Precedence: real shell env vars WIN over .env (load_dotenv does not
+# override existing vars by default). If you want .env to always win,
+# pass override=True to load_dotenv().
 BASE_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = BASE_DIR.parent
 
+try:
+    from dotenv import load_dotenv  # type: ignore
+
+    # Preferred location: automation/.env (next to this file)
+    _env_file = BASE_DIR / ".env"
+    if _env_file.exists():
+        load_dotenv(_env_file)
+    else:
+        # Fallback: project-root .env (one level up)
+        _env_file_root = PROJECT_ROOT / ".env"
+        if _env_file_root.exists():
+            load_dotenv(_env_file_root)
+except ImportError:
+    # python-dotenv not installed — fall back to shell env vars only.
+    # Install with: python -m pip install python-dotenv
+    pass
+
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
 BASE_URL = "http://localhost:5173"
 
 # ---------------------------------------------------------------------------
@@ -83,4 +112,5 @@ AI_MAX_CALLS_PER_RUN = 80   # unchanged — but now you'll use ~45
 AI_MIN_SECONDS_BETWEEN_CALLS = 4.0
 
 # Reads GEMINI_API_KEY first, falls back to GOOGLE_API_KEY.
+# Both come from either the shell env or automation/.env (loaded above).
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")

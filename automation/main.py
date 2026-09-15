@@ -6,6 +6,7 @@ from playwright.sync_api import sync_playwright
 from config import (
     BASE_URL,
     EXCEL_FILE,
+    RESULTS_FILE,
     HEADLESS,
     SCREENSHOT_DIR,
     AI_ENABLED,
@@ -13,7 +14,7 @@ from config import (
     AI_MAX_CALLS_PER_RUN,
 )
 from excel_reader import load_test_cases
-from excel_writer import write_results
+from excel_writer import ExcelResultWriter
 from step_parser import parse_step
 from executor import execute_step, settle_after_step
 from screenshot_manager import capture_screenshot
@@ -41,15 +42,6 @@ def _human_step_label(parsed: dict, raw: str) -> str:
 
 
 def _compute_scroll_target(parsed: dict, next_parsed: dict | None) -> str | None:
-    """
-    Decide which element to focus *before* the screenshot for this step.
-
-    Priority:
-      1. What the NEXT step is waiting for (that's the freshly rendered
-         content produced by the CURRENT action).
-      2. Otherwise, this step's own target.
-      3. Otherwise, None (SCREENSHOT and OPEN are handled by the caller).
-    """
     cmd = parsed.get("command")
     if cmd == "OPEN":
         return None
@@ -62,7 +54,6 @@ def _compute_scroll_target(parsed: dict, next_parsed: dict | None) -> str | None
 
 
 def _briefly_settle_for_failure(page) -> None:
-    """Give the app a moment to render an error UI before the FAILED screenshot."""
     try:
         page.wait_for_timeout(200)
         wait_for_animations(page, timeout=1_000)
@@ -71,23 +62,6 @@ def _briefly_settle_for_failure(page) -> None:
 
 
 def _should_verify_with_ai(cmd: str, next_parsed: dict | None, is_last_step: bool) -> bool:
-    """
-    Decide whether to send this step's screenshot to AI.
-
-    When AI_VERIFY_EVERY_SCREENSHOT=True, every screenshot is verified
-    (high quota cost — only feasible on a paid Gemini plan).
-
-    When False (default, free-tier friendly), verify only the checkpoints
-    that actually prove the test result:
-
-      * SCREENSHOT steps       (explicit checkpoint in the test data)
-      * The final step         (belt-and-braces, in case there's no SCREENSHOT)
-      * ASSERT_VISIBLE *or* WAIT_FOR immediately before a SCREENSHOT step
-                              (the exact frame where the error/confirmation
-                               is being asserted)
-
-    Everything else is skipped — this reduces per-test calls from ~11 to ~3.
-    """
     if not AI_ENABLED:
         return False
     if AI_VERIFY_EVERY_SCREENSHOT:
@@ -99,14 +73,14 @@ def _should_verify_with_ai(cmd: str, next_parsed: dict | None, is_last_step: boo
         return True
 
     nxt = (next_parsed or {}).get("command")
-    # The step right before the SCREENSHOT is the one that proves the result.
     if cmd in ("ASSERT_VISIBLE", "ASSERT_TEXT", "WAIT_FOR") and nxt == "SCREENSHOT":
         return True
 
     return False
-    
+
+
 # ---------------------------------------------------------------------------
-# Single test-case runner
+# Single test-case runner (unchanged from Part 4)
 # ---------------------------------------------------------------------------
 def run_one_test(browser, test_case, ai_call_budget=None) -> TestExecutionResult:
     context = browser.new_context()
@@ -124,9 +98,6 @@ def run_one_test(browser, test_case, ai_call_budget=None) -> TestExecutionResult
     failure_reason = None
     test_start = time.perf_counter()
     total = len(parsed_steps)
-
-    # Tracks the "focus element" across steps so SCREENSHOT steps inherit
-    # the previous step's framing (e.g. a validation error).
     last_focus: str | None = None
 
     for idx, (raw_step, parsed) in enumerate(parsed_steps, start=1):
@@ -141,7 +112,6 @@ def run_one_test(browser, test_case, ai_call_budget=None) -> TestExecutionResult
             value=parsed.get("value"),
         )
 
-        # --- Decide what the viewport should focus on for THIS step -------
         if cmd == "OPEN":
             last_focus = None
             scroll_target = None
@@ -154,14 +124,9 @@ def run_one_test(browser, test_case, ai_call_budget=None) -> TestExecutionResult
 
         step_start = time.perf_counter()
         try:
-            # 1. Execute the action
             execute_step(page, parsed)
-
-            # 2. Wait for the app to reach a relevant, stable state (Bug #1 fix)
             settle_after_step(page, parsed, next_parsed)
 
-            # 3. Screenshot after EVERY step. Centre-scroll the focus element
-            #    so small validation errors are always fully visible.
             label = ""
             if cmd == "SCREENSHOT" and parsed.get("target"):
                 label = parsed["target"]
@@ -169,7 +134,6 @@ def run_one_test(browser, test_case, ai_call_budget=None) -> TestExecutionResult
             sr.screenshot_path = capture_screenshot(
                 page, test_case.test_id, idx, label, scroll_target=scroll_target
             )
-
             sr.status = "PASS"
             print(f"  [OK]  Step {idx}/{total}  {_human_step_label(parsed, raw_step)}")
             if sr.screenshot_path:
@@ -181,7 +145,6 @@ def run_one_test(browser, test_case, ai_call_budget=None) -> TestExecutionResult
             deterministic_status = "FAIL"
             failure_reason = f"Step {idx} ({cmd}): {e}"
 
-            # Failure screenshot - still try to centre on the failure target.
             _briefly_settle_for_failure(page)
             try:
                 sr.screenshot_path = capture_screenshot(
@@ -199,10 +162,7 @@ def run_one_test(browser, test_case, ai_call_budget=None) -> TestExecutionResult
         # ---------------- AI Vision verification ---------------------------
         is_last_step = (idx == total)
         if sr.screenshot_path and _should_verify_with_ai(cmd, next_parsed, is_last_step):
-            budget_ok = (
-                ai_call_budget is None
-                or ai_call_budget["remaining"] > 0
-            )
+            budget_ok = (ai_call_budget is None or ai_call_budget["remaining"] > 0)
 
             if not budget_ok:
                 sr.ai_status = "NOT RUN"
@@ -253,14 +213,11 @@ def run_one_test(browser, test_case, ai_call_budget=None) -> TestExecutionResult
         sr.duration_ms = int((time.perf_counter() - step_start) * 1000)
         step_results.append(sr)
 
-        # Stop executing further steps of THIS test on failure, but the
-        # caller moves on to the next test.
         if sr.status == "FAIL":
             break
 
     test_duration_ms = int((time.perf_counter() - test_start) * 1000)
 
-    # ---------------- Final aggregation (deterministic + AI) --------------
     final_status, ai_status, ai_summary = aggregate_final_status(
         deterministic_status=deterministic_status,
         step_results=step_results,
@@ -302,9 +259,10 @@ def run_one_test(browser, test_case, ai_call_budget=None) -> TestExecutionResult
 # ---------------------------------------------------------------------------
 def run_tests() -> list[TestExecutionResult]:
     print("=" * 60)
-    print("AI HOTEL TEST AUTOMATION - PART 4 (AI VISION)")
+    print("AI HOTEL TEST AUTOMATION - PART 5 (EXCEL RESULT UPDATE)")
     print("=" * 60)
     print(f"Excel:      {EXCEL_FILE}")
+    print(f"Results:    {RESULTS_FILE}")
     print(f"Base URL:   {BASE_URL}")
     print(f"Headless:   {HEADLESS}")
     print(f"Run ID:     {Path(SCREENSHOT_DIR).name}")
@@ -325,7 +283,6 @@ def run_tests() -> list[TestExecutionResult]:
 
     print(f"Tests found: {len(test_cases)}\n")
 
-    # Shared AI call budget across the whole run.
     ai_call_budget = {
         "remaining": AI_MAX_CALLS_PER_RUN if AI_MAX_CALLS_PER_RUN > 0 else 10**9
     }
@@ -333,44 +290,56 @@ def run_tests() -> list[TestExecutionResult]:
     results: list[TestExecutionResult] = []
     passed = failed = 0
 
-    with sync_playwright() as p:
-        try:
-            browser = p.chromium.launch(headless=HEADLESS)
-        except Exception as e:
-            print(f"[FATAL] Browser launch failed: {e}")
-            return []
+    # ---- Single-writer Excel queue (Bug #3 fix) --------------------------
+    excel_writer = ExcelResultWriter()
+    excel_writer.start()
 
-        for tc in test_cases:
-            print(f"Running {tc.test_id} - {tc.test_name}")
+    try:
+        with sync_playwright() as p:
             try:
-                result = run_one_test(browser, tc, ai_call_budget)
+                browser = p.chromium.launch(headless=HEADLESS)
             except Exception as e:
-                print(f"  [ERROR] {tc.test_id} crashed at orchestrator level: {e}")
-                result = TestExecutionResult(
-                    test_id=tc.test_id,
-                    test_name=tc.test_name,
-                    category=tc.category,
-                    expected_result=tc.expected_result,
-                    status="FAIL",
-                    step_results=[],
-                    failure_reason=f"Orchestrator error: {e}",
-                    ai_status="NOT RUN",
-                    ai_observation="Orchestrator error before AI verification.",
-                )
-            results.append(result)
-            if result.status == "PASS":
-                passed += 1
-            else:
-                failed += 1
-            print("")
+                print(f"[FATAL] Browser launch failed: {e}")
+                return []
 
-        browser.close()
+            try:
+                for tc in test_cases:
+                    print(f"Running {tc.test_id} - {tc.test_name}")
+                    try:
+                        result = run_one_test(browser, tc, ai_call_budget)
+                    except Exception as e:
+                        print(f"  [ERROR] {tc.test_id} crashed at orchestrator level: {e}")
+                        result = TestExecutionResult(
+                            test_id=tc.test_id,
+                            test_name=tc.test_name,
+                            category=tc.category,
+                            expected_result=tc.expected_result,
+                            status="FAIL",
+                            step_results=[],
+                            failure_reason=f"Orchestrator error: {e}",
+                            ai_status="NOT RUN",
+                            ai_observation="Orchestrator error before AI verification.",
+                        )
 
-    # ----- Excel write-back ------------------------------------------------
-    print("-" * 60)
-    write_results(results)
+                    results.append(result)
+                    # Per-test persistence (Part 5) — enqueue immediately.
+                    excel_writer.submit(result)
 
-    # ----- Summary ---------------------------------------------------------
+                    if result.status == "PASS":
+                        passed += 1
+                    else:
+                        failed += 1
+                    print("")
+            finally:
+                try:
+                    browser.close()
+                except Exception as e:
+                    print(f"[WARN] browser.close() failed: {e}")
+    finally:
+        # Always drain the queue — even if the browser or a test crashed.
+        excel_writer.close()
+
+    # ----- Final summary --------------------------------------------------
     print("=" * 60)
     print("EXECUTION SUMMARY")
     print("=" * 60)
@@ -378,6 +347,18 @@ def run_tests() -> list[TestExecutionResult]:
     print(f"Passed:   {passed}")
     print(f"Failed:   {failed}")
     print(f"Skipped:  0")
+    print("")
+    print("Excel persistence:")
+    print(f"  Results file:          {RESULTS_FILE}")
+    print(f"  Submitted:             {excel_writer.submitted_count}")
+    print(f"  Successfully written:  {excel_writer.success_count}")
+    print(f"  Failed writes:         {excel_writer.failure_count}")
+    if excel_writer.failed_test_ids:
+        print(f"  Failed Test IDs:       {', '.join(excel_writer.failed_test_ids)}")
+    if excel_writer.last_error:
+        print(f"  Last error:            {excel_writer.last_error}")
+    if excel_writer.has_failures():
+        print("  WARNING: Some results could not be persisted.")
     print("")
     print(f"Screenshots: {SCREENSHOT_DIR}")
     print(f"AI Verification: {'ENABLED' if AI_ENABLED else 'DISABLED'}")

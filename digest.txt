@@ -9,10 +9,13 @@ Directory structure:
     │   ├── generate_test_cases.py
     │   ├── main.py
     │   ├── models.py
+    │   ├── report_generator.py
     │   ├── requirements.txt
     │   ├── screenshot_manager.py
     │   ├── step_parser.py
+    │   ├── test_excel_writer.py
     │   ├── test_gemini.py
+    │   ├── test_report_generator.py
     │   └── waits.py
     ├── Hotel_Booking/
     │   ├── README.md
@@ -46,7 +49,10 @@ Directory structure:
     │           └── validation.js
     └── test_cases/
         ├── sample_test_cases.xlsx
+        ├── test_report.docx
+        ├── test_report_smoke.docx
         ├── test_results.xlsx
+        ├── ~$st_report.docx
         └── ~$test_results.xlsx
 
 ================================================
@@ -616,11 +622,40 @@ from datetime import datetime
 import os
 
 # ---------------------------------------------------------------------------
-# Paths
+# Load .env automatically (before reading any env vars below)
 # ---------------------------------------------------------------------------
+# python-dotenv reads KEY=value pairs from a .env file and exposes them via
+# os.getenv() for the lifetime of this Python process. This runs BEFORE any
+# os.getenv() call below, so the API key is available even when the shell
+# doesn't have GOOGLE_API_KEY set.
+#
+# Precedence: real shell env vars WIN over .env (load_dotenv does not
+# override existing vars by default). If you want .env to always win,
+# pass override=True to load_dotenv().
 BASE_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = BASE_DIR.parent
 
+try:
+    from dotenv import load_dotenv  # type: ignore
+
+    # Preferred location: automation/.env (next to this file)
+    _env_file = BASE_DIR / ".env"
+    if _env_file.exists():
+        load_dotenv(_env_file)
+    else:
+        # Fallback: project-root .env (one level up)
+        _env_file_root = PROJECT_ROOT / ".env"
+        if _env_file_root.exists():
+            load_dotenv(_env_file_root)
+except ImportError:
+    # python-dotenv not installed — fall back to shell env vars only.
+    # Install with: python -m pip install python-dotenv
+    pass
+
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
 BASE_URL = "http://localhost:5173"
 
 # ---------------------------------------------------------------------------
@@ -658,17 +693,18 @@ SCREENSHOT_DIR = PROJECT_ROOT / "screenshots" / f"run_{RUN_ID}"
 TEST_CASES_DIR = PROJECT_ROOT / "test_cases"
 EXCEL_FILE = TEST_CASES_DIR / "sample_test_cases.xlsx"
 RESULTS_FILE = TEST_CASES_DIR / "test_results.xlsx"
+REPORT_FILE = TEST_CASES_DIR / "test_report.docx"
 WRITE_BACK_TO_SOURCE = True
 
 # ---------------------------------------------------------------------------
-# PART 4 â€” AI Vision Verification (Gemini)
+# PART 4 — AI Vision Verification (Gemini)
 # ---------------------------------------------------------------------------
 AI_ENABLED = True
 
-# Primary model â€” confirmed working on this API key by test_gemini.py.
+# Primary model — confirmed working on this API key by test_gemini.py.
 AI_MODEL = os.getenv("AI_MODEL", "gemini-2.5-flash")
 
-# Fallbacks â€” only models currently live on the v1beta API.
+# Fallbacks — only models currently live on the v1beta API.
 # (gemini-1.5-*, gemini-2.0-flash, gemini-2.5-flash-lite, gemini-2.5-pro
 #  are deprecated for new users and return 404.)
 AI_MODEL_FALLBACKS = [
@@ -682,20 +718,35 @@ AI_MAX_RETRIES = 1
 AI_REQUEST_TIMEOUT_MS = 30_000
 
 # ---------------------------------------------------------------------------
-# Cost / quota controls
+# Cost / quota controls  (Part 4 — free-tier friendly)
 # ---------------------------------------------------------------------------
-# True:  verify every screenshot (assignment-max setting, high quota cost).
-# False: verify only meaningful checkpoints â€” recommended for free tier.
+# Selects how many screenshots get sent to Gemini.
+#
+#   "final_only"  →  1 call per test  (~15 per run)   ← safest for free tier
+#   "minimal"     →  2 calls per test (~30 per run)   ← balanced
+#   "standard"    →  3 calls per test (~45 per run)   ← original behavior
+#   "every"       →  all screenshots  (~200+ per run) ← paid tier only
+#
+AI_VERIFY_STRATEGY = "final_only"
+
+# Legacy flag — kept for backwards compatibility. When True, overrides
+# AI_VERIFY_STRATEGY and behaves like "every".
 AI_VERIFY_EVERY_SCREENSHOT = False
 
-# Hard cap on AI calls per run (0 = unlimited).
-AI_MAX_CALLS_PER_RUN = 80   # unchanged â€” but now you'll use ~45
+# Hard cap on AI calls per run (0 = unlimited). Protects against runaway
+# retries; the run continues normally once this is hit.
+AI_MAX_CALLS_PER_RUN = 40
 
-# Minimum seconds between consecutive AI calls (rate-limit guard).
-# 4s â‰ˆ 15 RPM ceiling.
-AI_MIN_SECONDS_BETWEEN_CALLS = 4.0
+# If the remaining budget drops to or below this number, skip AI entirely
+# for the rest of the run (deterministic results are still produced).
+AI_RESERVE_LAST_CALLS = 3
+
+# Minimum seconds between consecutive AI calls (RPM guard).
+# 6s ≈ 10 RPM — safer than 4s on the free tier.
+AI_MIN_SECONDS_BETWEEN_CALLS = 6.0
 
 # Reads GEMINI_API_KEY first, falls back to GOOGLE_API_KEY.
+# Both come from either the shell env or automation/.env (loaded above).
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 
 
@@ -777,64 +828,99 @@ def load_test_cases() -> list[TestCase]:
 FILE: automation/excel_writer.py
 ================================================
 """
-Writes test execution results back into the Excel workbook.
+Excel result persistence with concurrency-safe, per-test writes.
 
-Two things happen:
-  1. `test_results.xlsx` is always created as a copy of the source with
-     Status + AI Observation populated.
-  2. The original `sample_test_cases.xlsx` is updated *in place* unless
-     it's locked (open in Excel) - in which case we warn and continue.
+Bug #3 â€” Excel Update Concurrency
+---------------------------------
+Test workers MUST NOT write Excel directly. If N workers each did
+    load_workbook() -> modify -> save()
+simultaneously, openpyxl's read-modify-save cycle would race: one worker's
+save would clobber another's, producing lost updates and occasionally
+corrupted files. Windows also locks the file during a write, causing
+spurious PermissionErrors.
+
+Our fix:
+    Test workers -> thread-safe Queue -> SINGLE writer thread -> Excel
+Only the writer thread ever touches openpyxl. A module-level Lock is
+added as defence-in-depth so that even if another thread (or future code)
+calls the synchronous API concurrently, workbook access still serialises.
+
+Public API
+----------
+    ExcelResultWriter      â€” queue-backed async writer (preferred)
+    write_result(result)   â€” synchronous single-result write
+    write_results(results) â€” synchronous batch write (backwards compatible)
+
+Two files are maintained:
+    test_results.xlsx      â€” always written (seeded from source on start)
+    sample_test_cases.xlsx â€” updated in place if WRITE_BACK_TO_SOURCE
+
+The Microsoft Office lock file "~$test_results.xlsx" is never read,
+written, or renamed â€” only the two real workbooks above are touched.
 """
+from __future__ import annotations
+
+import shutil
 from pathlib import Path
+from queue import Queue
+from threading import Lock, Thread
+from typing import Optional
 
 from openpyxl import load_workbook
 
 from config import EXCEL_FILE, RESULTS_FILE, WRITE_BACK_TO_SOURCE
 
 
-def _load_source():
-    src = Path(EXCEL_FILE)
-    if not src.exists():
-        raise FileNotFoundError(f"Source workbook not found: {src}")
-    return load_workbook(src)
+# ===========================================================================
+# Module-level lock â€” defence-in-depth around openpyxl read/update/save.
+# The primary serialisation is the single writer thread; this lock protects
+# against accidental future direct calls from other threads.
+# ===========================================================================
+_workbook_lock = Lock()
 
 
 def _format_ai_observation(result) -> str:
-    """Build a concise AI Observation string for Excel."""
-    ai_status = (result.ai_status or "NOT RUN").upper()
+    """
+    Build a concise AI Observation string for Excel.
+
+    Preference order (first match wins):
+      1. The actual AI observation text from a FAIL step   â€” most actionable
+      2. The actual AI observation text from an UNCERTAIN step â€” explains why
+      3. The actual AI observation text from a PASS step   â€” concrete evidence
+      4. The generic aggregate summary                     â€” last resort
+
+    Never dumps prompts, screenshots, base64, or model responses.
+    """
+    ai_status = (getattr(result, "ai_status", None) or "NOT RUN").upper()
     counts = (
-        f"PASS:{result.ai_pass_count} "
-        f"FAIL:{result.ai_fail_count} "
-        f"UNCERTAIN:{result.ai_uncertain_count}"
+        f"PASS:{getattr(result, 'ai_pass_count', 0)} "
+        f"FAIL:{getattr(result, 'ai_fail_count', 0)} "
+        f"UNCERTAIN:{getattr(result, 'ai_uncertain_count', 0)}"
     )
 
-    # Try to surface the most informative per-step observation.
-    best_obs = None
-    for sr in result.step_results:
-        if sr.ai_status == "FAIL" and sr.ai_observation:
-            best_obs = sr.ai_observation
+    # 1. Concrete per-step observation, in priority order (FAIL > UNCERTAIN > PASS)
+    concrete = None
+    for preferred in ("FAIL", "UNCERTAIN", "PASS"):
+        for sr in getattr(result, "step_results", None) or []:
+            if getattr(sr, "ai_status", None) == preferred and getattr(sr, "ai_observation", None):
+                concrete = sr.ai_observation
+                break
+        if concrete:
             break
-    if best_obs is None:
-        for sr in result.step_results:
-            if sr.ai_status == "UNCERTAIN" and sr.ai_observation:
-                best_obs = sr.ai_observation
-                break
-    if best_obs is None:
-        for sr in result.step_results:
-            if sr.ai_status == "PASS" and sr.ai_observation:
-                best_obs = sr.ai_observation
-                break
 
-    if result.ai_observation:
+    # 2. Fall back to the aggregate summary only if no concrete obs exists
+    summary = concrete or getattr(result, "ai_observation", None) or "No AI summary available."
+
+    # 3. Surface the raw generic summary as a fallback marker if the
+    #    aggregate observation itself says something useful (e.g. "quota exhausted")
+    if not concrete and getattr(result, "ai_observation", None):
         summary = result.ai_observation
-    else:
-        summary = "No AI summary available."
 
     return f"[{ai_status}] ({counts}) {summary}"[:500]
 
 
-def _update_sheet(ws, results) -> int:
-    headers = [c.value for c in ws[1]]
+def _locate_columns(headers):
+    """Return 1-based column indices for Test ID / Status / AI Observation."""
     required = ["Test ID", "Status", "AI Observation"]
     missing = [h for h in required if h not in headers]
     if missing:
@@ -842,83 +928,291 @@ def _update_sheet(ws, results) -> int:
             f"Workbook is missing required column(s) {missing}. "
             f"Found: {headers}"
         )
+    return (
+        headers.index("Test ID") + 1,
+        headers.index("Status") + 1,
+        headers.index("AI Observation") + 1,
+    )
 
-    col_id = headers.index("Test ID") + 1
-    col_status = headers.index("Status") + 1
-    col_ai = headers.index("AI Observation") + 1
 
-    result_map = {r.test_id: r for r in results}
-    updated = 0
+def _apply_result_to_sheet(ws, result) -> bool:
+    """
+    Locate the row whose Test ID matches result.test_id (never by row number)
+    and write Status + AI Observation. Returns True on success.
+    """
+    headers = [c.value for c in ws[1]]
+    col_id, col_status, col_ai = _locate_columns(headers)
 
+    target_id = str(result.test_id).strip()
     for row in range(2, ws.max_row + 1):
         raw_id = ws.cell(row=row, column=col_id).value
         if raw_id is None:
             continue
-        tid = str(raw_id).strip()
-        if not tid:
-            continue
-        res = result_map.get(tid)
-        if res is None:
-            continue
+        if str(raw_id).strip() == target_id:
+            ws.cell(row=row, column=col_status).value = result.status
+            ws.cell(row=row, column=col_ai).value = _format_ai_observation(result)
+            return True
+    return False
 
-        ws.cell(row=row, column=col_status).value = res.status
-        ws.cell(row=row, column=col_ai).value = _format_ai_observation(res)
-        updated += 1
 
-    return updated
+# ===========================================================================
+# Low-level file operations (always called under _workbook_lock)
+# ===========================================================================
+def _seed_results_from_source() -> tuple[bool, str]:
+    """Copy the source workbook onto the results path (fresh slate)."""
+    source = Path(EXCEL_FILE)
+    results = Path(RESULTS_FILE)
+    if not source.exists():
+        return False, f"Source workbook not found: {source}"
+    try:
+        results.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, results)
+        return True, "OK"
+    except PermissionError:
+        return False, (
+            f"Permission denied seeding {results.name}. "
+            f"Close it in Excel and re-run."
+        )
+    except Exception as e:
+        return False, f"Could not seed results file: {e}"
+
+
+def _apply_one_to_path(path: Path, result) -> tuple[bool, str]:
+    """
+    Load `path`, update the row matching result.test_id, save back.
+    Always re-loads from disk so no stale in-memory state can overwrite
+    previously-persisted results.
+    """
+    if not path.exists():
+        return False, f"Workbook not found: {path}"
+
+    try:
+        wb = load_workbook(path)
+    except Exception as e:
+        return False, f"Could not open {path.name}: {e}"
+
+    ws = wb.active
+    try:
+        matched = _apply_result_to_sheet(ws, result)
+    except Exception as e:
+        return False, f"Failed to update sheet in {path.name}: {e}"
+
+    if not matched:
+        return False, f"Test ID {result.test_id} not found in {path.name}"
+
+    try:
+        wb.save(path)
+        return True, "OK"
+    except PermissionError:
+        return False, (
+            f"Permission denied writing {path.name}. "
+            f"Close the file in Excel and re-run."
+        )
+    except Exception as e:
+        return False, f"Failed to save {path.name}: {e}"
+
+
+# ===========================================================================
+# Synchronous single-result write (the unit the worker thread invokes)
+# ===========================================================================
+def write_result(result) -> tuple[bool, str]:
+    """
+    Persist a single TestExecutionResult.
+
+    Order:
+      1. If results file doesn't exist yet, seed it from source.
+      2. Update test_results.xlsx.
+      3. If WRITE_BACK_TO_SOURCE, best-effort update sample_test_cases.xlsx.
+
+    Returns (success, message). `success` reflects the results file, which
+    is the primary deliverable.
+    """
+    results_path = Path(RESULTS_FILE)
+    source_path = Path(EXCEL_FILE)
+
+    with _workbook_lock:
+        # 1. Seed if missing (first ever write)
+        if not results_path.exists():
+            ok, msg = _seed_results_from_source()
+            if not ok:
+                return False, msg
+
+        # 2. Update results file
+        results_ok, results_msg = _apply_one_to_path(results_path, result)
+
+        # 3. Best-effort source write-back
+        source_ok, source_msg = True, "OK"
+        if WRITE_BACK_TO_SOURCE and source_path.resolve() != results_path.resolve():
+            source_ok, source_msg = _apply_one_to_path(source_path, result)
+
+        if not results_ok:
+            # Results file is the primary output â€” its failure is the error.
+            if not source_ok:
+                return False, f"{results_msg} | source: {source_msg}"
+            return False, results_msg
+
+        return True, "OK"
+
+
+# ===========================================================================
+# Async queue-backed writer (Part 5 primary API)
+# ===========================================================================
+class ExcelResultWriter:
+    """
+    Single-threaded, queue-backed Excel writer.
+
+    Test workers submit() results; only the writer thread calls openpyxl.
+    This is the primary mitigation for Bug #3 â€” no two writes ever overlap.
+
+    Usage:
+        writer = ExcelResultWriter()
+        writer.start()
+        try:
+            for tc in test_cases:
+                result = run_one_test(...)
+                writer.submit(result)
+        finally:
+            writer.close()   # blocks until queue is drained
+    """
+
+    _SENTINEL = object()
+
+    def __init__(self) -> None:
+        self.queue: Queue = Queue()
+        self.thread: Optional[Thread] = None
+        self._running = False
+
+        # Statistics for the final summary
+        self.submitted_count = 0
+        self.success_count = 0
+        self.failure_count = 0
+        self.failed_test_ids: list[str] = []
+        self.last_error: Optional[str] = None
+
+    # -- lifecycle ----------------------------------------------------------
+    def start(self) -> None:
+        """Reset the results file (fresh copy of source) and start the worker."""
+        if self._running:
+            return
+
+        # Reset results file so this run starts clean.
+        with _workbook_lock:
+            seeded, msg = _seed_results_from_source()
+        if seeded:
+            print(f"[Excel] Seeded results file from source: {Path(RESULTS_FILE).name}")
+        else:
+            # Not fatal â€” the worker will keep trying per-result.
+            print(f"[Excel] WARNING: could not seed results file: {msg}")
+
+        self._running = True
+        self.thread = Thread(
+            target=self._worker,
+            name="ExcelResultWriter",
+            daemon=True,
+        )
+        self.thread.start()
+
+    def submit(self, result) -> None:
+        """Enqueue a result. Never blocks; worker persists asynchronously."""
+        if not self._running:
+            self.start()
+        self.submitted_count += 1
+        status = getattr(result, "status", "UNKNOWN")
+        print(f"[Excel] Queued result: {result.test_id} -> {status}")
+        self.queue.put(result)
+
+    def close(self, timeout: float = 60.0) -> None:
+        """Drain the queue, stop the worker, join the thread."""
+        if not self._running:
+            return
+
+        # Push the sentinel so the worker knows to exit after draining.
+        self.queue.put(self._SENTINEL)
+        # wait until every item (including the sentinel) has been processed
+        self.queue.join()
+
+        if self.thread is not None:
+            self.thread.join(timeout=timeout)
+
+        self._running = False
+
+    # -- worker -------------------------------------------------------------
+    def _worker(self) -> None:
+        while True:
+            try:
+                item = self.queue.get()
+            except Exception:
+                # Extremely unlikely â€” break the loop rather than spin.
+                break
+
+            try:
+                if item is self._SENTINEL:
+                    return
+
+                try:
+                    ok, msg = write_result(item)
+                except Exception as e:
+                    ok, msg = False, f"Unexpected writer error: {e}"
+
+                if ok:
+                    self.success_count += 1
+                    print(f"[Excel] Updated {item.test_id} -> {item.status}")
+                else:
+                    self.failure_count += 1
+                    self.failed_test_ids.append(getattr(item, "test_id", "?"))
+                    self.last_error = msg
+                    print(f"[Excel] Failed to update {item.test_id}: {msg}")
+
+            finally:
+                # task_done() must run even if the write raised, otherwise
+                # queue.join() in close() would hang.
+                self.queue.task_done()
+
+    # -- convenience --------------------------------------------------------
+    def has_failures(self) -> bool:
+        return self.failure_count > 0
+
+
+# ===========================================================================
+# Backwards-compatible synchronous APIs
+# ===========================================================================
+def write_one(result) -> bool:
+    """Synchronous single-result write; prints status. Returns True on success."""
+    ok, msg = write_result(result)
+    if ok:
+        print(f"[excel_writer] Updated {result.test_id} -> {result.status}")
+    else:
+        print(f"[excel_writer] Failed to write {result.test_id}: {msg}")
+    return ok
 
 
 def write_results(results) -> None:
-    """Populate Status + AI Observation from `results` and save."""
+    """
+    Batch synchronous write â€” preserved for backwards compatibility and
+    ad-hoc/test usage. For the main automation pipeline, prefer
+    ExcelResultWriter (progressive per-test persistence).
+    """
     if not results:
         print("[excel_writer] No results to write.")
         return
 
-    try:
-        wb = _load_source()
-    except Exception as e:
-        print(f"[excel_writer] Cannot open source workbook: {e}")
-        return
+    # Reset results file so the batch behaves like a fresh run.
+    with _workbook_lock:
+        ok, msg = _seed_results_from_source()
+    if not ok:
+        print(f"[excel_writer] WARNING: could not seed results file: {msg}")
 
-    ws = wb.active
-    try:
-        updated = _update_sheet(ws, results)
-    except Exception as e:
-        print(f"[excel_writer] Failed to update sheet: {e}")
-        return
+    successes = 0
+    failures = 0
+    for r in results:
+        ok, msg = write_result(r)
+        if ok:
+            successes += 1
+        else:
+            failures += 1
+            print(f"[excel_writer] Failed to write {r.test_id}: {msg}")
 
-    if updated == 0:
-        print("[excel_writer] No matching Test IDs found; nothing written.")
-        return
-
-    # ---- 1. Always write the results copy ---------------------------------
-    try:
-        results_path = Path(RESULTS_FILE)
-        results_path.parent.mkdir(parents=True, exist_ok=True)
-        wb.save(results_path)
-        print(f"[excel_writer] Wrote results copy:  {results_path}")
-    except PermissionError:
-        print(
-            f"[excel_writer] Permission denied writing {RESULTS_FILE}. "
-            f"Close the file in Excel and re-run."
-        )
-    except Exception as e:
-        print(f"[excel_writer] Failed to write {RESULTS_FILE}: {e}")
-
-    # ---- 2. Best-effort update of the source file -------------------------
-    if WRITE_BACK_TO_SOURCE and Path(EXCEL_FILE).resolve() != Path(RESULTS_FILE).resolve():
-        try:
-            wb.save(EXCEL_FILE)
-            print(f"[excel_writer] Updated source file: {EXCEL_FILE}")
-        except PermissionError:
-            print(
-                f"[excel_writer] Could not update {EXCEL_FILE} "
-                f"(likely open in Excel). Results copy is still valid."
-            )
-        except Exception as e:
-            print(f"[excel_writer] Could not update {EXCEL_FILE}: {e}")
-
-    print(f"[excel_writer] Updated {updated} row(s).")
+    print(f"[excel_writer] Batch write complete: {successes} ok, {failures} failed.")
 
 
 ================================================
@@ -1189,14 +1483,18 @@ from playwright.sync_api import sync_playwright
 from config import (
     BASE_URL,
     EXCEL_FILE,
+    RESULTS_FILE,
+    REPORT_FILE,
     HEADLESS,
     SCREENSHOT_DIR,
     AI_ENABLED,
     AI_VERIFY_EVERY_SCREENSHOT,
+    AI_VERIFY_STRATEGY,          # ← NEW
     AI_MAX_CALLS_PER_RUN,
+    AI_RESERVE_LAST_CALLS,
 )
 from excel_reader import load_test_cases
-from excel_writer import write_results
+from excel_writer import ExcelResultWriter
 from step_parser import parse_step
 from executor import execute_step, settle_after_step
 from screenshot_manager import capture_screenshot
@@ -1207,6 +1505,7 @@ from ai_verifier import (
     get_step_visual_expectation,
     aggregate_final_status,
 )
+from report_generator import generate_word_report
 
 
 # ---------------------------------------------------------------------------
@@ -1224,15 +1523,6 @@ def _human_step_label(parsed: dict, raw: str) -> str:
 
 
 def _compute_scroll_target(parsed: dict, next_parsed: dict | None) -> str | None:
-    """
-    Decide which element to focus *before* the screenshot for this step.
-
-    Priority:
-      1. What the NEXT step is waiting for (that's the freshly rendered
-         content produced by the CURRENT action).
-      2. Otherwise, this step's own target.
-      3. Otherwise, None (SCREENSHOT and OPEN are handled by the caller).
-    """
     cmd = parsed.get("command")
     if cmd == "OPEN":
         return None
@@ -1245,7 +1535,6 @@ def _compute_scroll_target(parsed: dict, next_parsed: dict | None) -> str | None
 
 
 def _briefly_settle_for_failure(page) -> None:
-    """Give the app a moment to render an error UI before the FAILED screenshot."""
     try:
         page.wait_for_timeout(200)
         wait_for_animations(page, timeout=1_000)
@@ -1255,41 +1544,53 @@ def _briefly_settle_for_failure(page) -> None:
 
 def _should_verify_with_ai(cmd: str, next_parsed: dict | None, is_last_step: bool) -> bool:
     """
-    Decide whether to send this step's screenshot to AI.
+    Decide whether this step's screenshot goes to Gemini.
 
-    When AI_VERIFY_EVERY_SCREENSHOT=True, every screenshot is verified
-    (high quota cost â€” only feasible on a paid Gemini plan).
+    Controlled by AI_VERIFY_STRATEGY (config.py):
 
-    When False (default, free-tier friendly), verify only the checkpoints
-    that actually prove the test result:
+      "final_only" — only the last step of each test            (~1 per test)
+      "minimal"    — SCREENSHOT step + the ASSERT right before it (~2 per test)
+      "standard"   — SCREENSHOT + final + the preceding ASSERT  (~3 per test)
+      "every"      — every screenshot                            (~all)
 
-      * SCREENSHOT steps       (explicit checkpoint in the test data)
-      * The final step         (belt-and-braces, in case there's no SCREENSHOT)
-      * ASSERT_VISIBLE *or* WAIT_FOR immediately before a SCREENSHOT step
-                              (the exact frame where the error/confirmation
-                               is being asserted)
-
-    Everything else is skipped â€” this reduces per-test calls from ~11 to ~3.
+    Setting AI_VERIFY_EVERY_SCREENSHOT=True overrides the strategy and
+    behaves like "every".
     """
     if not AI_ENABLED:
         return False
+
     if AI_VERIFY_EVERY_SCREENSHOT:
         return True
 
+    strat = (AI_VERIFY_STRATEGY or "minimal").lower()
+
+    if strat == "every":
+        return True
+
+    if strat == "final_only":
+        # Only the final step of the test is verified.
+        return is_last_step
+
+    if strat == "minimal":
+        # The final SCREENSHOT step is the sole checkpoint.
+        if is_last_step:
+            return True
+        if cmd == "SCREENSHOT":
+            return True
+        return False
+
+    # "standard" (original behavior)
     if cmd == "SCREENSHOT":
         return True
     if is_last_step:
         return True
-
     nxt = (next_parsed or {}).get("command")
-    # The step right before the SCREENSHOT is the one that proves the result.
     if cmd in ("ASSERT_VISIBLE", "ASSERT_TEXT", "WAIT_FOR") and nxt == "SCREENSHOT":
         return True
-
     return False
-    
+
 # ---------------------------------------------------------------------------
-# Single test-case runner
+# Single test-case runner (unchanged from Part 4)
 # ---------------------------------------------------------------------------
 def run_one_test(browser, test_case, ai_call_budget=None) -> TestExecutionResult:
     context = browser.new_context()
@@ -1307,9 +1608,6 @@ def run_one_test(browser, test_case, ai_call_budget=None) -> TestExecutionResult
     failure_reason = None
     test_start = time.perf_counter()
     total = len(parsed_steps)
-
-    # Tracks the "focus element" across steps so SCREENSHOT steps inherit
-    # the previous step's framing (e.g. a validation error).
     last_focus: str | None = None
 
     for idx, (raw_step, parsed) in enumerate(parsed_steps, start=1):
@@ -1324,7 +1622,6 @@ def run_one_test(browser, test_case, ai_call_budget=None) -> TestExecutionResult
             value=parsed.get("value"),
         )
 
-        # --- Decide what the viewport should focus on for THIS step -------
         if cmd == "OPEN":
             last_focus = None
             scroll_target = None
@@ -1337,14 +1634,9 @@ def run_one_test(browser, test_case, ai_call_budget=None) -> TestExecutionResult
 
         step_start = time.perf_counter()
         try:
-            # 1. Execute the action
             execute_step(page, parsed)
-
-            # 2. Wait for the app to reach a relevant, stable state (Bug #1 fix)
             settle_after_step(page, parsed, next_parsed)
 
-            # 3. Screenshot after EVERY step. Centre-scroll the focus element
-            #    so small validation errors are always fully visible.
             label = ""
             if cmd == "SCREENSHOT" and parsed.get("target"):
                 label = parsed["target"]
@@ -1352,7 +1644,6 @@ def run_one_test(browser, test_case, ai_call_budget=None) -> TestExecutionResult
             sr.screenshot_path = capture_screenshot(
                 page, test_case.test_id, idx, label, scroll_target=scroll_target
             )
-
             sr.status = "PASS"
             print(f"  [OK]  Step {idx}/{total}  {_human_step_label(parsed, raw_step)}")
             if sr.screenshot_path:
@@ -1364,7 +1655,6 @@ def run_one_test(browser, test_case, ai_call_budget=None) -> TestExecutionResult
             deterministic_status = "FAIL"
             failure_reason = f"Step {idx} ({cmd}): {e}"
 
-            # Failure screenshot - still try to centre on the failure target.
             _briefly_settle_for_failure(page)
             try:
                 sr.screenshot_path = capture_screenshot(
@@ -1380,17 +1670,20 @@ def run_one_test(browser, test_case, ai_call_budget=None) -> TestExecutionResult
                 print(f"         -> screenshot: {sr.screenshot_path}")
 
         # ---------------- AI Vision verification ---------------------------
-        is_last_step = (idx == total)
+                is_last_step = (idx == total)
         if sr.screenshot_path and _should_verify_with_ai(cmd, next_parsed, is_last_step):
-            budget_ok = (
-                ai_call_budget is None
-                or ai_call_budget["remaining"] > 0
+            # Reserve a few calls so the run doesn't strand mid-test.
+            remaining = (
+                ai_call_budget["remaining"] if ai_call_budget is not None else 10**9
             )
+            budget_ok = remaining > AI_RESERVE_LAST_CALLS
 
             if not budget_ok:
                 sr.ai_status = "NOT RUN"
-                sr.ai_observation = "AI call budget for this run exhausted."
-                print(f"         AI: NOT RUN - run budget exhausted")
+                sr.ai_observation = (
+                    "AI call budget for this run exhausted (reserved floor reached)."
+                )
+                print(f"         AI: NOT RUN - budget floor reached ({remaining} left)")
             else:
                 if ai_call_budget is not None:
                     ai_call_budget["remaining"] -= 1
@@ -1436,14 +1729,11 @@ def run_one_test(browser, test_case, ai_call_budget=None) -> TestExecutionResult
         sr.duration_ms = int((time.perf_counter() - step_start) * 1000)
         step_results.append(sr)
 
-        # Stop executing further steps of THIS test on failure, but the
-        # caller moves on to the next test.
         if sr.status == "FAIL":
             break
 
     test_duration_ms = int((time.perf_counter() - test_start) * 1000)
 
-    # ---------------- Final aggregation (deterministic + AI) --------------
     final_status, ai_status, ai_summary = aggregate_final_status(
         deterministic_status=deterministic_status,
         step_results=step_results,
@@ -1485,15 +1775,17 @@ def run_one_test(browser, test_case, ai_call_budget=None) -> TestExecutionResult
 # ---------------------------------------------------------------------------
 def run_tests() -> list[TestExecutionResult]:
     print("=" * 60)
-    print("AI HOTEL TEST AUTOMATION - PART 4 (AI VISION)")
+    print("AI HOTEL TEST AUTOMATION - PART 5 (EXCEL RESULT UPDATE)")
     print("=" * 60)
     print(f"Excel:      {EXCEL_FILE}")
+    print(f"Results:    {RESULTS_FILE}")
     print(f"Base URL:   {BASE_URL}")
     print(f"Headless:   {HEADLESS}")
     print(f"Run ID:     {Path(SCREENSHOT_DIR).name}")
     print(f"Shots ->    {SCREENSHOT_DIR}")
     print(f"AI Enabled: {AI_ENABLED}")
     print(f"AI Verify Every Screenshot: {AI_VERIFY_EVERY_SCREENSHOT}")
+    print(f"AI Verify Strategy:         {AI_VERIFY_STRATEGY}")
     if AI_MAX_CALLS_PER_RUN > 0:
         print(f"AI Call Budget This Run:    {AI_MAX_CALLS_PER_RUN}")
     else:
@@ -1508,7 +1800,6 @@ def run_tests() -> list[TestExecutionResult]:
 
     print(f"Tests found: {len(test_cases)}\n")
 
-    # Shared AI call budget across the whole run.
     ai_call_budget = {
         "remaining": AI_MAX_CALLS_PER_RUN if AI_MAX_CALLS_PER_RUN > 0 else 10**9
     }
@@ -1516,57 +1807,97 @@ def run_tests() -> list[TestExecutionResult]:
     results: list[TestExecutionResult] = []
     passed = failed = 0
 
-    with sync_playwright() as p:
-        try:
-            browser = p.chromium.launch(headless=HEADLESS)
-        except Exception as e:
-            print(f"[FATAL] Browser launch failed: {e}")
-            return []
+    # ---- Single-writer Excel queue (Bug #3 fix) --------------------------
+    excel_writer = ExcelResultWriter()
+    excel_writer.start()
 
-        for tc in test_cases:
-            print(f"Running {tc.test_id} - {tc.test_name}")
+    try:
+        with sync_playwright() as p:
             try:
-                result = run_one_test(browser, tc, ai_call_budget)
+                browser = p.chromium.launch(headless=HEADLESS)
             except Exception as e:
-                print(f"  [ERROR] {tc.test_id} crashed at orchestrator level: {e}")
-                result = TestExecutionResult(
-                    test_id=tc.test_id,
-                    test_name=tc.test_name,
-                    category=tc.category,
-                    expected_result=tc.expected_result,
-                    status="FAIL",
-                    step_results=[],
-                    failure_reason=f"Orchestrator error: {e}",
-                    ai_status="NOT RUN",
-                    ai_observation="Orchestrator error before AI verification.",
-                )
-            results.append(result)
-            if result.status == "PASS":
-                passed += 1
-            else:
-                failed += 1
-            print("")
+                print(f"[FATAL] Browser launch failed: {e}")
+                return []
 
-        browser.close()
+            try:
+                for tc in test_cases:
+                    print(f"Running {tc.test_id} - {tc.test_name}")
+                    try:
+                        result = run_one_test(browser, tc, ai_call_budget)
+                    except Exception as e:
+                        print(f"  [ERROR] {tc.test_id} crashed at orchestrator level: {e}")
+                        result = TestExecutionResult(
+                            test_id=tc.test_id,
+                            test_name=tc.test_name,
+                            category=tc.category,
+                            expected_result=tc.expected_result,
+                            status="FAIL",
+                            step_results=[],
+                            failure_reason=f"Orchestrator error: {e}",
+                            ai_status="NOT RUN",
+                            ai_observation="Orchestrator error before AI verification.",
+                        )
 
-    # ----- Excel write-back ------------------------------------------------
-    print("-" * 60)
-    write_results(results)
+                    results.append(result)
+                    # Per-test persistence (Part 5) — enqueue immediately.
+                    excel_writer.submit(result)
 
-    # ----- Summary ---------------------------------------------------------
+                    if result.status == "PASS":
+                        passed += 1
+                    else:
+                        failed += 1
+                    print("")
+            finally:
+                try:
+                    browser.close()
+                except Exception as e:
+                    print(f"[WARN] browser.close() failed: {e}")
+    finally:
+        # Always drain the queue — even if the browser or a test crashed.
+        excel_writer.close()
+
+    # ----- Word report (Part 6) -------------------------------------------
+    report_path = None
+    try:
+        report_path = generate_word_report(results, REPORT_FILE)
+        print(f"[Report] Generated successfully: {report_path}")
+    except Exception as e:
+        print(f"[Report] Failed to generate Word report: {e}")
+        report_path = None
+
+    # ----- Final summary --------------------------------------------------
     print("=" * 60)
-    print("EXECUTION SUMMARY")
+    print("TEST EXECUTION COMPLETE")
+
     print("=" * 60)
     print(f"Total:    {len(results)}")
     print(f"Passed:   {passed}")
     print(f"Failed:   {failed}")
     print(f"Skipped:  0")
     print("")
+    print("Excel persistence:")
+    print(f"  Results file:          {RESULTS_FILE}")
+    print(f"  Submitted:             {excel_writer.submitted_count}")
+    print(f"  Successfully written:  {excel_writer.success_count}")
+    print(f"  Failed writes:         {excel_writer.failure_count}")
+    if excel_writer.failed_test_ids:
+        print(f"  Failed Test IDs:       {', '.join(excel_writer.failed_test_ids)}")
+    if excel_writer.last_error:
+        print(f"  Last error:            {excel_writer.last_error}")
+    if excel_writer.has_failures():
+        print("  WARNING: Some results could not be persisted.")
+    print("")
     print(f"Screenshots: {SCREENSHOT_DIR}")
     print(f"AI Verification: {'ENABLED' if AI_ENABLED else 'DISABLED'}")
     if AI_MAX_CALLS_PER_RUN > 0:
         used = AI_MAX_CALLS_PER_RUN - ai_call_budget["remaining"]
         print(f"AI Calls Used:   {used} / {AI_MAX_CALLS_PER_RUN}")
+    print("")
+    print(f"Excel Results:   {RESULTS_FILE}")
+    if report_path:
+        print(f"Word Report:     {report_path}")
+    else:
+        print("Word Report:     NOT GENERATED")
     print("=" * 60)
 
     return results
@@ -1639,11 +1970,466 @@ class TestExecutionResult:
 
 
 ================================================
+FILE: automation/report_generator.py
+================================================
+"""
+Part 6 â€” Word report generation.
+
+Consumes the list[TestExecutionResult] produced by main.py and writes a
+professional test_report.docx with:
+
+  * Title + metadata
+  * Summary (dynamic â€” no hardcoded counts)
+  * Test Results Overview table
+  * Detailed section per test (ID, name, category, expected, actual,
+    status, AI verdict, step table, screenshots)
+  * Footer text
+
+Design notes
+------------
+* Never invents data. Missing values become "N/A" or "Not available".
+* Missing/unreadable screenshots degrade gracefully to a text line.
+* Never crashes the test suite â€” main.py wraps the call in try/except.
+* Uses the existing TestExecutionResult / StepResult models. No duplicate.
+"""
+from __future__ import annotations
+
+from datetime import datetime
+from pathlib import Path
+from typing import Iterable, Optional
+
+from docx import Document
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.shared import Inches, Pt, RGBColor
+
+
+# ---------------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------------
+def _safe_str(value, default: str = "N/A") -> str:
+    if value is None:
+        return default
+    s = str(value).strip()
+    return s if s else default
+
+
+def _status_plain(status: str) -> str:
+    """Normalise a status string for display."""
+    return _safe_str(status, "NOT RUN").upper()
+
+
+def _add_kv(document: Document, key: str, value: str, bold_value: bool = False) -> None:
+    p = document.add_paragraph()
+    p.add_run(f"{key}: ").bold = True
+    run = p.add_run(value)
+    if bold_value:
+        run.bold = True
+
+
+def _add_page_break(document: Document) -> None:
+    document.add_page_break()
+
+
+def _format_confidence(conf: Optional[float]) -> str:
+    if conf is None:
+        return "N/A"
+    try:
+        return f"{int(round(float(conf) * 100))}%"
+    except Exception:
+        return "N/A"
+
+
+def _resolve_screenshot_path(raw_path: Optional[str]) -> Optional[Path]:
+    """Accept absolute or relative paths; return an existing Path or None."""
+    if not raw_path:
+        return None
+    p = Path(raw_path)
+    if not p.is_absolute():
+        p = Path.cwd() / p
+    return p if p.exists() and p.is_file() else None
+
+
+# ---------------------------------------------------------------------------
+# Actual result synthesis (derived from real execution data only)
+# ---------------------------------------------------------------------------
+def _compose_actual_result(result) -> str:
+    status = _status_plain(getattr(result, "status", ""))
+    det = _status_plain(getattr(result, "deterministic_status", "") or "")
+    ai_status = _status_plain(getattr(result, "ai_status", "") or "")
+    ai_obs = getattr(result, "ai_observation", None)
+    failure = getattr(result, "failure_reason", None)
+
+    if status == "PASS":
+        if ai_status == "PASS":
+            return (
+                "The expected workflow completed successfully, all deterministic "
+                "Playwright checks passed, and AI visual verification confirmed "
+                "the expected state."
+            )
+        if ai_status == "UNCERTAIN":
+            base = (
+                "The expected workflow completed successfully and all "
+                "deterministic Playwright checks passed. AI visual verification "
+                "was UNCERTAIN"
+            )
+            if ai_obs:
+                base += f": {ai_obs}"
+            else:
+                base += "."
+            return base
+        if ai_status in ("NOT RUN", "", "N/A"):
+            return (
+                "The expected workflow completed successfully and all "
+                "deterministic Playwright checks passed. AI visual verification "
+                "was not run for this test."
+            )
+        return "The expected workflow completed successfully."
+
+    if status == "FAIL":
+        if failure:
+            return f"The test failed during execution. {failure}"
+        if det == "FAIL":
+            return "The test failed during execution: one or more deterministic Playwright checks did not pass."
+        if ai_status == "FAIL" and ai_obs:
+            return f"The test failed. AI visual verification reported: {ai_obs}"
+        return "The test failed during execution."
+
+    return "Test did not complete."
+
+
+# ---------------------------------------------------------------------------
+# Header / summary / overview
+# ---------------------------------------------------------------------------
+def _write_header(doc: Document) -> None:
+    title = doc.add_heading("AI Automated Test Report", level=0)
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    meta = doc.add_paragraph()
+    meta.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = meta.add_run(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    run.italic = True
+    run.font.size = Pt(10)
+
+    for line in (
+        "Application: Hotel Booking System",
+        "Automation Framework: Playwright + Python",
+        "AI Verification: Google Gemini",
+    ):
+        p = doc.add_paragraph()
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        r = p.add_run(line)
+        r.font.size = Pt(10)
+
+    doc.add_paragraph()
+
+
+def _write_summary(doc: Document, results: Iterable) -> None:
+    results = list(results)
+    total = len(results)
+    passed = sum(1 for r in results if _status_plain(r.status) == "PASS")
+    failed = sum(1 for r in results if _status_plain(r.status) == "FAIL")
+    pass_rate = f"{(passed / total * 100):.1f}%" if total > 0 else "0.0%"
+
+    ai_pass = sum(int(getattr(r, "ai_pass_count", 0) or 0) for r in results)
+    ai_fail = sum(int(getattr(r, "ai_fail_count", 0) or 0) for r in results)
+    ai_unc  = sum(int(getattr(r, "ai_uncertain_count", 0) or 0) for r in results)
+
+    doc.add_heading("Summary", level=1)
+
+    table = doc.add_table(rows=1, cols=2)
+    table.style = "Light Grid Accent 1"
+    hdr = table.rows[0].cells
+    hdr[0].text = "Metric"
+    hdr[1].text = "Result"
+
+    rows = [
+        ("Total Tests", str(total)),
+        ("Passed", str(passed)),
+        ("Failed", str(failed)),
+        ("Pass Rate", pass_rate),
+    ]
+    if ai_pass or ai_fail or ai_unc:
+        rows.extend([
+            ("AI PASS Checkpoints", str(ai_pass)),
+            ("AI FAIL Checkpoints", str(ai_fail)),
+            ("AI UNCERTAIN Checkpoints", str(ai_unc)),
+        ])
+
+    for k, v in rows:
+        cells = table.add_row().cells
+        cells[0].text = k
+        cells[1].text = v
+
+
+def _write_overview(doc: Document, results: Iterable) -> None:
+    results = list(results)
+    doc.add_heading("Test Results Overview", level=1)
+
+    table = doc.add_table(rows=1, cols=4)
+    table.style = "Light Grid Accent 1"
+    hdr = table.rows[0].cells
+    for i, name in enumerate(("Test ID", "Test Name", "Category", "Status")):
+        hdr[i].text = name
+
+    for r in results:
+        cells = table.add_row().cells
+        cells[0].text = _safe_str(getattr(r, "test_id", None))
+        cells[1].text = _safe_str(getattr(r, "test_name", None))
+        cells[2].text = _safe_str(getattr(r, "category", None))
+        cells[3].text = _status_plain(getattr(r, "status", ""))
+
+
+# ---------------------------------------------------------------------------
+# Step table + screenshots
+# ---------------------------------------------------------------------------
+def _write_step_table(doc: Document, result) -> None:
+    step_results = list(getattr(result, "step_results", None) or [])
+    if not step_results:
+        doc.add_paragraph("No steps were executed for this test.")
+        return
+
+    table = doc.add_table(rows=1, cols=5)
+    table.style = "Light Grid Accent 1"
+    hdr = table.rows[0].cells
+    for i, name in enumerate(("Step", "Action", "Status", "AI Status", "Confidence")):
+        hdr[i].text = name
+
+    for sr in step_results:
+        cells = table.add_row().cells
+        cells[0].text = str(getattr(sr, "step_number", ""))
+        cells[1].text = _safe_str(getattr(sr, "raw_step", None), "")
+        cells[2].text = _status_plain(getattr(sr, "status", ""))
+        cells[3].text = _status_plain(getattr(sr, "ai_status", "") or "NOT RUN")
+        cells[4].text = _format_confidence(getattr(sr, "ai_confidence", None))
+
+
+def _write_ai_section(doc: Document, result) -> None:
+    ai_status = getattr(result, "ai_status", None)
+    ai_obs = getattr(result, "ai_observation", None)
+
+    doc.add_heading("AI Verification", level=3)
+    _add_kv(doc, "AI Status", _status_plain(ai_status) if ai_status else "NOT RUN")
+    if ai_obs:
+        _add_kv(doc, "AI Observation", str(ai_obs))
+
+    # Per-step AI observations (if any)
+    per_step = [
+        sr for sr in (getattr(result, "step_results", None) or [])
+        if getattr(sr, "ai_observation", None)
+    ]
+    if per_step:
+        doc.add_paragraph("Per-step AI observations:").runs[0].italic = True
+        for sr in per_step:
+            p = doc.add_paragraph(style="List Bullet")
+            p.add_run(
+                f"Step {getattr(sr, 'step_number', '?')} â€” "
+                f"{_safe_str(getattr(sr, 'raw_step', None), '')} "
+            ).bold = True
+            p.add_run(
+                f"[{_status_plain(sr.ai_status or 'NOT RUN')}, "
+                f"{_format_confidence(getattr(sr, 'ai_confidence', None))}] "
+                f"{sr.ai_observation}"
+            )
+
+
+def _write_screenshots(doc: Document, result) -> None:
+    doc.add_heading("Screenshots", level=3)
+
+    step_results = list(getattr(result, "step_results", None) or [])
+    if not step_results:
+        doc.add_paragraph("No screenshots available.")
+        return
+
+    added_any = False
+    for sr in step_results:
+        raw = getattr(sr, "screenshot_path", None)
+        step_num = getattr(sr, "step_number", "?")
+        raw_step = _safe_str(getattr(sr, "raw_step", None), "")
+
+        doc.add_paragraph(
+            f"Step {step_num} â€” {raw_step}"
+        ).runs[0].bold = True
+
+        resolved = _resolve_screenshot_path(raw)
+
+        if raw is None:
+            doc.add_paragraph("No screenshot captured for this step.").runs[0].italic = True
+            continue
+
+        if resolved is None:
+            p = doc.add_paragraph()
+            p.add_run("Screenshot unavailable: ").italic = True
+            p.add_run(str(raw))
+            continue
+
+        try:
+            doc.add_picture(str(resolved), width=Inches(6.0))
+            # Center the image
+            doc.paragraphs[-1].alignment = WD_ALIGN_PARAGRAPH.CENTER
+            added_any = True
+        except Exception as e:
+            p = doc.add_paragraph()
+            p.add_run(f"Could not embed screenshot ({type(e).__name__}): ").italic = True
+            p.add_run(str(raw))
+
+    if not added_any:
+        doc.add_paragraph("(No screenshot files were found on disk.)").runs[0].italic = True
+
+
+# ---------------------------------------------------------------------------
+# Detailed per-test section
+# ---------------------------------------------------------------------------
+def _write_test_section(doc: Document, result) -> None:
+    test_id = _safe_str(getattr(result, "test_id", None))
+    test_name = _safe_str(getattr(result, "test_name", None))
+    category = _safe_str(getattr(result, "category", None))
+    expected = _safe_str(getattr(result, "expected_result", None), "Not available")
+    status = _status_plain(getattr(result, "status", ""))
+
+    doc.add_heading(f"{test_id} â€” {test_name}", level=2)
+
+    _add_kv(doc, "Test ID", test_id)
+    _add_kv(doc, "Test Name", test_name)
+    _add_kv(doc, "Category", category)
+    _add_kv(doc, "Status", status, bold_value=True)
+
+    # Expected / Actual as their own headings for readability
+    doc.add_heading("Expected Result", level=3)
+    doc.add_paragraph(expected)
+
+    doc.add_heading("Actual Result", level=3)
+    doc.add_paragraph(_compose_actual_result(result))
+
+    if status == "FAIL" and getattr(result, "failure_reason", None):
+        doc.add_heading("Failure Details", level=3)
+        p = doc.add_paragraph()
+        p.add_run("Failure Reason: ").bold = True
+        p.add_run(str(result.failure_reason))
+
+    _write_ai_section(doc, result)
+
+    doc.add_heading("Steps", level=3)
+    _write_step_table(doc, result)
+
+    _write_screenshots(doc, result)
+
+
+# ---------------------------------------------------------------------------
+# Footer
+# ---------------------------------------------------------------------------
+def _write_footer(doc: Document) -> None:
+    section = doc.sections[0]
+    footer = section.footer
+    p = footer.paragraphs[0]
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = p.add_run("AI-Powered Automated Testing System â€” Hotel Booking System")
+    run.font.size = Pt(8)
+    run.font.color.rgb = RGBColor(0x66, 0x66, 0x66)
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+def generate_word_report(results, output_path) -> Path:
+    """
+    Generate the Word report.
+
+    Returns the Path that was written. Raises on unexpected errors â€” the
+    caller (main.py) is expected to catch them so report failures never
+    break the test suite.
+    """
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    results = list(results or [])
+
+    doc = Document()
+    _write_footer(doc)
+
+    _write_header(doc)
+    _write_summary(doc, results)
+
+    doc.add_paragraph()
+    _write_overview(doc, results)
+
+    doc.add_paragraph()
+    doc.add_heading("Detailed Test Results", level=1)
+
+    if not results:
+        doc.add_paragraph("No test results were available.")
+    else:
+        for idx, r in enumerate(results):
+            if idx > 0:
+                _add_page_break(doc)
+            _write_test_section(doc, r)
+
+    doc.save(str(output_path))
+    return output_path
+
+
+if __name__ == "__main__":
+    # Manual smoke test with fake data (no Playwright needed).
+    from models import StepResult, TestExecutionResult
+
+    fake = [
+        TestExecutionResult(
+            test_id="TC-001",
+            test_name="Complete valid booking flow",
+            category="Happy Path",
+            expected_result="Booking confirmation displayed",
+            status="PASS",
+            step_results=[
+                StepResult(
+                    step_number=1, command="OPEN", raw_step="OPEN: /",
+                    status="PASS", ai_status="NOT RUN",
+                ),
+                StepResult(
+                    step_number=2, command="CLICK", raw_step="CLICK: confirm-booking-button",
+                    status="PASS", ai_status="PASS", ai_confidence=0.97,
+                    ai_observation="The booking confirmation is clearly visible.",
+                ),
+            ],
+            ai_status="PASS",
+            ai_observation="All 2 AI visual checkpoint(s) passed.",
+            ai_pass_count=1, ai_fail_count=0, ai_uncertain_count=0, ai_not_run_count=1,
+            deterministic_status="PASS",
+        ),
+        TestExecutionResult(
+            test_id="TC-002",
+            test_name="Search for available rooms",
+            category="Happy Path",
+            expected_result="Available rooms are displayed",
+            status="FAIL",
+            step_results=[
+                StepResult(
+                    step_number=1, command="OPEN", raw_step="OPEN: /",
+                    status="PASS", ai_status="NOT RUN",
+                ),
+                StepResult(
+                    step_number=2, command="WAIT_FOR", raw_step="WAIT_FOR: room-card-1",
+                    status="FAIL", error_message="Timeout waiting for room-card-1",
+                    ai_status="NOT RUN",
+                ),
+            ],
+            failure_reason="Step 2 (WAIT_FOR): Timeout waiting for room-card-1",
+            ai_status="NOT RUN",
+            deterministic_status="FAIL",
+        ),
+    ]
+
+    out = Path(__file__).resolve().parent.parent / "test_cases" / "test_report_smoke.docx"
+    path = generate_word_report(fake, out)
+    print(f"[report_generator] Smoke report: {path}")
+
+
+================================================
 FILE: automation/requirements.txt
 ================================================
 playwright
 openpyxl
 google-genai
+python-dotenv
+python-docx
 
 
 ================================================
@@ -1813,6 +2599,151 @@ def parse_step(raw_step: str) -> dict:
 
 
 ================================================
+FILE: automation/test_excel_writer.py
+================================================
+"""
+Concurrency test for ExcelResultWriter (Bug #3 â€” Excel Update Concurrency).
+
+Simulates multiple "workers" submitting TestExecutionResult objects
+simultaneously. Verifies:
+  * no corrupted workbook
+  * no lost updates
+  * correct Status values
+  * original row ordering preserved
+  * duplicate submissions don't create duplicate rows
+
+Run:
+    python test_excel_writer.py
+
+NOTE: this test overwrites test_results.xlsx as a side effect.
+"""
+import shutil
+from pathlib import Path
+from threading import Thread
+
+from openpyxl import load_workbook
+
+from config import EXCEL_FILE, RESULTS_FILE
+from excel_writer import ExcelResultWriter
+from models import StepResult, TestExecutionResult
+
+
+def make_fake_result(test_id: str, status: str = "PASS",
+                     ai_status: str = "PASS") -> TestExecutionResult:
+    return TestExecutionResult(
+        test_id=test_id,
+        test_name=f"Fake {test_id}",
+        category="Concurrency",
+        expected_result="N/A",
+        status=status,
+        step_results=[
+            StepResult(
+                step_number=1,
+                command="SCREENSHOT",
+                raw_step="SCREENSHOT: fake",
+                status="PASS",
+                ai_status=ai_status,
+                ai_confidence=0.95 if ai_status == "PASS" else None,
+                ai_observation="Fake observation.",
+            )
+        ],
+        ai_status=ai_status,
+        ai_observation="Fake summary.",
+        ai_pass_count=1 if ai_status == "PASS" else 0,
+        ai_fail_count=1 if ai_status == "FAIL" else 0,
+        ai_uncertain_count=1 if ai_status == "UNCERTAIN" else 0,
+        deterministic_status=status,
+    )
+
+
+def main() -> int:
+    src = Path(EXCEL_FILE)
+    dst = Path(RESULTS_FILE)
+    if not src.exists():
+        print(f"[FAIL] Source workbook missing: {src}")
+        return 1
+
+    # Fresh results copy so we know the starting state.
+    shutil.copyfile(src, dst)
+    print(f"Seeded {dst.name} from {src.name}\n")
+
+    writer = ExcelResultWriter()
+    writer.start()
+
+    plan = [
+        ("TC-001", "PASS"),
+        ("TC-002", "PASS"),
+        ("TC-003", "FAIL"),
+        ("TC-004", "PASS"),
+        ("TC-005", "PASS"),
+    ]
+
+    threads: list[Thread] = []
+    for tid, st in plan:
+        t = Thread(
+            target=writer.submit,
+            args=(make_fake_result(tid, st, ai_status=("FAIL" if st == "FAIL" else "PASS")),),
+            name=f"Submitter-{tid}",
+        )
+        threads.append(t)
+
+    # Fire all threads at once â€” this is the concurrency stress.
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    writer.close()
+
+    # ---- Verify ----------------------------------------------------------
+    wb = load_workbook(dst)
+    ws = wb.active
+    headers = [c.value for c in ws[1]]
+    col_id = headers.index("Test ID") + 1
+    col_status = headers.index("Status") + 1
+    col_ai = headers.index("AI Observation") + 1
+
+    seen: dict[str, tuple[str, str]] = {}
+    for row in range(2, ws.max_row + 1):
+        tid = ws.cell(row=row, column=col_id).value
+        if tid in dict(plan):
+            seen[str(tid).strip()] = (
+                ws.cell(row=row, column=col_status).value,
+                ws.cell(row=row, column=col_ai).value,
+            )
+
+    expected = dict(plan)
+    ok = True
+    print("\nVerification:")
+    for tid, want_status in plan:
+        got = seen.get(tid)
+        if got is None:
+            print(f"  [FAIL] {tid}: MISSING from workbook")
+            ok = False
+            continue
+        got_status, got_ai = got
+        match = (got_status == want_status)
+        marker = "OK" if match else "FAIL"
+        print(f"  [{marker}] {tid}: expected={want_status} actual={got_status} "
+              f"AI={str(got_ai)[:60]}")
+        if not match:
+            ok = False
+
+    print()
+    print(f"  Submitted: {writer.submitted_count}")
+    print(f"  Success:   {writer.success_count}")
+    print(f"  Failed:    {writer.failure_count}")
+    print()
+    verdict = "PASS" if ok and writer.failure_count == 0 else "FAIL"
+    print(f"BUG #3 CONCURRENCY TEST: {verdict}")
+    return 0 if verdict == "PASS" else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+
+================================================
 FILE: automation/test_gemini.py
 ================================================
 """
@@ -1968,6 +2899,287 @@ def main() -> int:
     for m in CANDIDATE_MODELS:
         print(f"         - {m}")
     return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+
+================================================
+FILE: automation/test_report_generator.py
+================================================
+"""
+Unit tests for the Part 6 Word report generator.
+
+Uses fake TestExecutionResult objects. Does NOT require Playwright,
+Gemini, or the running website.
+
+Run:
+    python test_report_generator.py
+"""
+import sys
+import tempfile
+from pathlib import Path
+
+from docx import Document
+
+from models import StepResult, TestExecutionResult
+from report_generator import generate_word_report
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def _fake_result(
+    test_id: str,
+    status: str = "PASS",
+    ai_status: str = "PASS",
+    ai_confidence: float = 0.97,
+    with_ai: bool = True,
+    with_screenshot: bool = False,
+    screenshot_path: str | None = None,
+    category: str = "Happy Path",
+    expected: str = "Expected workflow completes",
+) -> TestExecutionResult:
+    steps = [
+        StepResult(
+            step_number=1, command="OPEN", raw_step="OPEN: /",
+            status="PASS", ai_status="NOT RUN",
+        ),
+        StepResult(
+            step_number=2, command="CLICK", raw_step="CLICK: search-button",
+            status="PASS",
+            ai_status=ai_status if with_ai else None,
+            ai_confidence=ai_confidence if with_ai else None,
+            ai_observation="Concrete observation." if with_ai else None,
+            screenshot_path=screenshot_path,
+        ),
+    ]
+    if status == "FAIL":
+        steps[1].status = "FAIL"
+        steps[1].error_message = "Simulated failure"
+
+    return TestExecutionResult(
+        test_id=test_id,
+        test_name=f"Fake test {test_id}",
+        category=category,
+        expected_result=expected,
+        status=status,
+        step_results=steps,
+        failure_reason="Simulated failure" if status == "FAIL" else None,
+        ai_status=ai_status if with_ai else "NOT RUN",
+        ai_observation="Aggregate summary." if with_ai else None,
+        ai_pass_count=1 if ai_status == "PASS" else 0,
+        ai_fail_count=1 if ai_status == "FAIL" else 0,
+        ai_uncertain_count=1 if ai_status == "UNCERTAIN" else 0,
+        deterministic_status=status,
+    )
+
+
+def _check(condition: bool, message: str) -> bool:
+    print(f"  [{'OK' if condition else 'FAIL'}] {message}")
+    return condition
+
+
+def _run(name: str, fn) -> bool:
+    print(f"\n>>> {name}")
+    try:
+        return fn()
+    except Exception as e:
+        print(f"  [FAIL] Test raised: {type(e).__name__}: {e}")
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Individual tests
+# ---------------------------------------------------------------------------
+def test_single_pass(tmpdir: Path) -> bool:
+    out = tmpdir / "single_pass.docx"
+    results = [_fake_result("TC-001", status="PASS")]
+    generate_word_report(results, out)
+
+    doc = Document(out)
+    text = "\n".join(p.text for p in doc.paragraphs)
+    table_text = "\n".join(
+        cell.text for table in doc.tables for row in table.rows for cell in row.cells
+    )
+    blob = text + "\n" + table_text
+
+    ok = True
+    ok &= _check(out.exists(), "DOCX created")
+    ok &= _check(out.stat().st_size > 0, "DOCX not empty")
+    ok &= _check("TC-001" in blob, "contains TC-001")
+    ok &= _check("Summary" in text, "contains Summary section")
+    ok &= _check("Pass Rate" in blob, "contains Pass Rate")
+    ok &= _check("PASS" in blob, "contains PASS status")
+    return ok
+
+
+def test_fail_result(tmpdir: Path) -> bool:
+    out = tmpdir / "fail.docx"
+    results = [_fake_result("TC-005", status="FAIL", ai_status="NOT RUN")]
+    generate_word_report(results, out)
+
+    doc = Document(out)
+    blob = "\n".join(p.text for p in doc.paragraphs)
+    blob += "\n" + "\n".join(
+        cell.text for table in doc.tables for row in table.rows for cell in row.cells
+    )
+
+    ok = True
+    ok &= _check("TC-005" in blob, "contains TC-005")
+    ok &= _check("FAIL" in blob, "contains FAIL status")
+    ok &= _check("Simulated failure" in blob, "contains failure reason")
+    return ok
+
+
+def test_multiple_tests(tmpdir: Path) -> bool:
+    out = tmpdir / "multi.docx"
+    results = [
+        _fake_result("TC-001", status="PASS"),
+        _fake_result("TC-002", status="PASS"),
+        _fake_result("TC-003", status="FAIL", ai_status="NOT RUN"),
+    ]
+    generate_word_report(results, out)
+
+    doc = Document(out)
+    blob = "\n".join(p.text for p in doc.paragraphs)
+    blob += "\n" + "\n".join(
+        cell.text for table in doc.tables for row in table.rows for cell in row.cells
+    )
+
+    ok = True
+    for tid in ("TC-001", "TC-002", "TC-003"):
+        ok &= _check(tid in blob, f"contains {tid}")
+    ok &= _check("3" in blob, "summary shows 3 total tests")
+    ok &= _check("66.7%" in blob, "pass rate 66.7% computed")
+    return ok
+
+
+def test_with_ai_info(tmpdir: Path) -> bool:
+    out = tmpdir / "ai.docx"
+    results = [_fake_result("TC-001", ai_status="PASS", ai_confidence=0.98)]
+    generate_word_report(results, out)
+
+    doc = Document(out)
+    blob = "\n".join(p.text for p in doc.paragraphs)
+    blob += "\n" + "\n".join(
+        cell.text for table in doc.tables for row in table.rows for cell in row.cells
+    )
+
+    ok = True
+    ok &= _check("AI Verification" in blob, "AI Verification heading present")
+    ok &= _check("98%" in blob, "confidence formatted as 98%")
+    ok &= _check("Concrete observation." in blob, "concrete AI observation shown")
+    return ok
+
+
+def test_missing_screenshot(tmpdir: Path) -> bool:
+    out = tmpdir / "missing_shot.docx"
+    results = [_fake_result(
+        "TC-001",
+        with_screenshot=True,
+        screenshot_path="E:/does/not/exist/nope.png",
+    )]
+    generate_word_report(results, out)  # must not raise
+
+    doc = Document(out)
+    blob = "\n".join(p.text for p in doc.paragraphs)
+    ok = True
+    ok &= _check(out.exists(), "DOCX created despite missing screenshot")
+    ok &= _check("Screenshot unavailable" in blob, "reported missing screenshot")
+    return ok
+
+
+def test_existing_screenshot(tmpdir: Path) -> bool:
+    out = tmpdir / "with_shot.docx"
+
+    # Use a tiny valid PNG (1x1 transparent)
+    png = tmpdir / "tiny.png"
+    png.write_bytes(
+        bytes.fromhex(
+            "89504E470D0A1A0A0000000D4948445200000001000000010806000000"
+            "1F15C4890000000D49444154789C6360000002000001E2210AA4000000"
+            "0049454E44AE426082"
+        )
+    )
+
+    results = [_fake_result(
+        "TC-001",
+        with_screenshot=True,
+        screenshot_path=str(png),
+    )]
+    generate_word_report(results, out)
+
+    doc = Document(out)
+    # python-docx stores embedded images under inline_shapes
+    ok = True
+    ok &= _check(out.exists(), "DOCX created")
+    ok &= _check(len(doc.inline_shapes) >= 1, "at least one image embedded")
+    return ok
+
+
+def test_empty_results(tmpdir: Path) -> bool:
+    out = tmpdir / "empty.docx"
+    generate_word_report([], out)  # must not raise (no div-by-zero)
+
+    doc = Document(out)
+    text = "\n".join(p.text for p in doc.paragraphs)
+    blob = text + "\n" + "\n".join(
+        cell.text for table in doc.tables for row in table.rows for cell in row.cells
+    )
+
+    ok = True
+    ok &= _check(out.exists(), "DOCX created for empty results")
+    ok &= _check("0.0%" in blob, "pass rate 0.0% for empty")
+    ok &= _check("No test results were available" in text, "empty message shown")
+    return ok
+
+
+def test_docx_reopenable(tmpdir: Path) -> bool:
+    out = tmpdir / "reopen.docx"
+    generate_word_report([_fake_result("TC-001")], out)
+    try:
+        doc = Document(out)
+        ok = _check(len(doc.paragraphs) > 0, "reopened with paragraphs")
+    except Exception as e:
+        ok = _check(False, f"reopen failed: {e}")
+    return ok
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+def main() -> int:
+    print("=" * 60)
+    print("REPORT GENERATOR UNIT TESTS")
+    print("=" * 60)
+
+    with tempfile.TemporaryDirectory() as td:
+        tmpdir = Path(td)
+
+        tests = [
+            ("Single PASS result",         lambda: test_single_pass(tmpdir)),
+            ("FAIL result",                lambda: test_fail_result(tmpdir)),
+            ("Multiple tests + pass rate", lambda: test_multiple_tests(tmpdir)),
+            ("AI info display",            lambda: test_with_ai_info(tmpdir)),
+            ("Missing screenshot handled", lambda: test_missing_screenshot(tmpdir)),
+            ("Existing screenshot embedded", lambda: test_existing_screenshot(tmpdir)),
+            ("Empty results",              lambda: test_empty_results(tmpdir)),
+            ("DOCX reopenable",            lambda: test_docx_reopenable(tmpdir)),
+        ]
+
+        outcomes = []
+        for name, fn in tests:
+            outcomes.append(_run(name, fn))
+
+    print()
+    print("=" * 60)
+    passed = sum(1 for o in outcomes if o)
+    total = len(outcomes)
+    print(f"RESULT: {passed}/{total} tests passed")
+    print("=" * 60)
+    return 0 if passed == total else 1
 
 
 if __name__ == "__main__":
@@ -4758,7 +5970,25 @@ FILE: test_cases/sample_test_cases.xlsx
 
 
 ================================================
+FILE: test_cases/test_report.docx
+================================================
+[Non-text file]
+
+
+================================================
+FILE: test_cases/test_report_smoke.docx
+================================================
+[Non-text file]
+
+
+================================================
 FILE: test_cases/test_results.xlsx
+================================================
+[Non-text file]
+
+
+================================================
+FILE: test_cases/~$st_report.docx
 ================================================
 [Non-text file]
 

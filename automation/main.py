@@ -7,11 +7,14 @@ from config import (
     BASE_URL,
     EXCEL_FILE,
     RESULTS_FILE,
+    REPORT_FILE,
     HEADLESS,
     SCREENSHOT_DIR,
     AI_ENABLED,
     AI_VERIFY_EVERY_SCREENSHOT,
+    AI_VERIFY_STRATEGY,          # ← NEW
     AI_MAX_CALLS_PER_RUN,
+    AI_RESERVE_LAST_CALLS,
 )
 from excel_reader import load_test_cases
 from excel_writer import ExcelResultWriter
@@ -25,6 +28,7 @@ from ai_verifier import (
     get_step_visual_expectation,
     aggregate_final_status,
 )
+from report_generator import generate_word_report
 
 
 # ---------------------------------------------------------------------------
@@ -62,22 +66,51 @@ def _briefly_settle_for_failure(page) -> None:
 
 
 def _should_verify_with_ai(cmd: str, next_parsed: dict | None, is_last_step: bool) -> bool:
+    """
+    Decide whether this step's screenshot goes to Gemini.
+
+    Controlled by AI_VERIFY_STRATEGY (config.py):
+
+      "final_only" — only the last step of each test            (~1 per test)
+      "minimal"    — SCREENSHOT step + the ASSERT right before it (~2 per test)
+      "standard"   — SCREENSHOT + final + the preceding ASSERT  (~3 per test)
+      "every"      — every screenshot                            (~all)
+
+    Setting AI_VERIFY_EVERY_SCREENSHOT=True overrides the strategy and
+    behaves like "every".
+    """
     if not AI_ENABLED:
         return False
+
     if AI_VERIFY_EVERY_SCREENSHOT:
         return True
 
+    strat = (AI_VERIFY_STRATEGY or "minimal").lower()
+
+    if strat == "every":
+        return True
+
+    if strat == "final_only":
+        # Only the final step of the test is verified.
+        return is_last_step
+
+    if strat == "minimal":
+        # The final SCREENSHOT step is the sole checkpoint.
+        if is_last_step:
+            return True
+        if cmd == "SCREENSHOT":
+            return True
+        return False
+
+    # "standard" (original behavior)
     if cmd == "SCREENSHOT":
         return True
     if is_last_step:
         return True
-
     nxt = (next_parsed or {}).get("command")
     if cmd in ("ASSERT_VISIBLE", "ASSERT_TEXT", "WAIT_FOR") and nxt == "SCREENSHOT":
         return True
-
     return False
-
 
 # ---------------------------------------------------------------------------
 # Single test-case runner (unchanged from Part 4)
@@ -162,12 +195,18 @@ def run_one_test(browser, test_case, ai_call_budget=None) -> TestExecutionResult
         # ---------------- AI Vision verification ---------------------------
         is_last_step = (idx == total)
         if sr.screenshot_path and _should_verify_with_ai(cmd, next_parsed, is_last_step):
-            budget_ok = (ai_call_budget is None or ai_call_budget["remaining"] > 0)
+            # Reserve a few calls so the run doesn't strand mid-test.
+            remaining = (
+                ai_call_budget["remaining"] if ai_call_budget is not None else 10**9
+            )
+            budget_ok = remaining > AI_RESERVE_LAST_CALLS
 
             if not budget_ok:
                 sr.ai_status = "NOT RUN"
-                sr.ai_observation = "AI call budget for this run exhausted."
-                print(f"         AI: NOT RUN - run budget exhausted")
+                sr.ai_observation = (
+                    "AI call budget for this run exhausted (reserved floor reached)."
+                )
+                print(f"         AI: NOT RUN - budget floor reached ({remaining} left)")
             else:
                 if ai_call_budget is not None:
                     ai_call_budget["remaining"] -= 1
@@ -269,6 +308,7 @@ def run_tests() -> list[TestExecutionResult]:
     print(f"Shots ->    {SCREENSHOT_DIR}")
     print(f"AI Enabled: {AI_ENABLED}")
     print(f"AI Verify Every Screenshot: {AI_VERIFY_EVERY_SCREENSHOT}")
+    print(f"AI Verify Strategy:         {AI_VERIFY_STRATEGY}")
     if AI_MAX_CALLS_PER_RUN > 0:
         print(f"AI Call Budget This Run:    {AI_MAX_CALLS_PER_RUN}")
     else:
@@ -339,9 +379,19 @@ def run_tests() -> list[TestExecutionResult]:
         # Always drain the queue — even if the browser or a test crashed.
         excel_writer.close()
 
+    # ----- Word report (Part 6) -------------------------------------------
+    report_path = None
+    try:
+        report_path = generate_word_report(results, REPORT_FILE)
+        print(f"[Report] Generated successfully: {report_path}")
+    except Exception as e:
+        print(f"[Report] Failed to generate Word report: {e}")
+        report_path = None
+
     # ----- Final summary --------------------------------------------------
     print("=" * 60)
-    print("EXECUTION SUMMARY")
+    print("TEST EXECUTION COMPLETE")
+
     print("=" * 60)
     print(f"Total:    {len(results)}")
     print(f"Passed:   {passed}")
@@ -365,6 +415,12 @@ def run_tests() -> list[TestExecutionResult]:
     if AI_MAX_CALLS_PER_RUN > 0:
         used = AI_MAX_CALLS_PER_RUN - ai_call_budget["remaining"]
         print(f"AI Calls Used:   {used} / {AI_MAX_CALLS_PER_RUN}")
+    print("")
+    print(f"Excel Results:   {RESULTS_FILE}")
+    if report_path:
+        print(f"Word Report:     {report_path}")
+    else:
+        print("Word Report:     NOT GENERATED")
     print("=" * 60)
 
     return results

@@ -74,6 +74,7 @@ SCREENSHOT_DIR = PROJECT_ROOT / "screenshots" / f"run_{RUN_ID}"
 TEST_CASES_DIR = PROJECT_ROOT / "test_cases"
 EXCEL_FILE = TEST_CASES_DIR / "sample_test_cases.xlsx"
 RESULTS_FILE = TEST_CASES_DIR / "test_results.xlsx"
+REPORT_FILE = TEST_CASES_DIR / "test_report.docx"
 WRITE_BACK_TO_SOURCE = True
 
 # ---------------------------------------------------------------------------
@@ -98,18 +99,32 @@ AI_MAX_RETRIES = 1
 AI_REQUEST_TIMEOUT_MS = 30_000
 
 # ---------------------------------------------------------------------------
-# Cost / quota controls
+# Cost / quota controls  (Part 4 — free-tier friendly)
 # ---------------------------------------------------------------------------
-# True:  verify every screenshot (assignment-max setting, high quota cost).
-# False: verify only meaningful checkpoints — recommended for free tier.
+# Selects how many screenshots get sent to Gemini.
+#
+#   "final_only"  →  1 call per test  (~15 per run)   ← safest for free tier
+#   "minimal"     →  2 calls per test (~30 per run)   ← balanced
+#   "standard"    →  3 calls per test (~45 per run)   ← original behavior
+#   "every"       →  all screenshots  (~200+ per run) ← paid tier only
+#
+AI_VERIFY_STRATEGY = "final_only"
+
+# Legacy flag — kept for backwards compatibility. When True, overrides
+# AI_VERIFY_STRATEGY and behaves like "every".
 AI_VERIFY_EVERY_SCREENSHOT = False
 
-# Hard cap on AI calls per run (0 = unlimited).
-AI_MAX_CALLS_PER_RUN = 80   # unchanged — but now you'll use ~45
+# Hard cap on AI calls per run (0 = unlimited). Protects against runaway
+# retries; the run continues normally once this is hit.
+AI_MAX_CALLS_PER_RUN = 40
 
-# Minimum seconds between consecutive AI calls (rate-limit guard).
-# 4s ≈ 15 RPM ceiling.
-AI_MIN_SECONDS_BETWEEN_CALLS = 4.0
+# If the remaining budget drops to or below this number, skip AI entirely
+# for the rest of the run (deterministic results are still produced).
+AI_RESERVE_LAST_CALLS = 3
+
+# Minimum seconds between consecutive AI calls (RPM guard).
+# 6s ≈ 10 RPM — safer than 4s on the free tier.
+AI_MIN_SECONDS_BETWEEN_CALLS = 6.0
 
 # Reads GEMINI_API_KEY first, falls back to GOOGLE_API_KEY.
 # Both come from either the shell env or automation/.env (loaded above).
